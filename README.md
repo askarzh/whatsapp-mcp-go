@@ -37,37 +37,40 @@ Start `whatsapp-bridge` -> then run `whatsapp-mcp-server` in your preferred mode
    The first time you run it, you will be prompted to scan a QR code. Scan the QR code with your WhatsApp mobile app to authenticate.
    After approximately 20 days, you will might need to re-authenticate.
 
-3. **Connect to the MCP server**
-    ```bash
-    cd whatsapp-mcp-server
-    go build -o whatsapp-mcp
-    ```
-   Copy the below json with the appropriate {{PATH}} values:
-   ```json
-   {
-        "mcpServers": {
-            "whatsapp-mcp": {
-            "command": "{{PROJECT_BASE_PATH}}/whatsapp-mcp-server/whatsapp-mcp"
-            }
-        },
-        "preferences": {
-            "sidebarMode": "chat",
-            "coworkScheduledTasksEnabled": false
-        }
-    }
-   ```
+   3. **Connect to the MCP server**
+       ```bash
+       cd whatsapp-mcp-server
+       go build -o whatsapp-mcp
+       ```
+      Copy the below json with the appropriate {{PATH}} values:
+      ```json
+      {
+           "mcpServers": {
+               "whatsapp-mcp": {
+                  "command": "{{PROJECT_BASE_PATH}}/whatsapp-mcp-server/whatsapp-mcp",
+                  "env": {
+                       "WHATSAPP_API_SECRET": "c3VwZXItbG9uZy1yYW5kb20tc3RyaW5nLW1pbmltdW0tb2YtNjQtY2hhcmFjdGVycy15b3UtbmVlZC10by1wYXN0ZS1oZXJl"
+                  }
+               }
+           },
+           "preferences": {
+               "sidebarMode": "chat",
+               "coworkScheduledTasksEnabled": false
+           }
+       }
+      ```
 
-   For **Claude**, save this as `claude_desktop_config.json` in your Claude Desktop configuration directory at:
+      For **Claude**, save this as `claude_desktop_config.json` in your Claude Desktop configuration directory at:
 
-   ```
-   ~/Library/Application Support/Claude/claude_desktop_config.json
-   ```
+      ```
+      ~/Library/Application Support/Claude/claude_desktop_config.json
+      ```
 
-   For **Cursor**, save this as `mcp.json` in your Cursor configuration directory at:
+      For **Cursor**, save this as `mcp.json` in your Cursor configuration directory at:
 
-   ```
-   ~/.cursor/mcp.json
-   ```
+      ```
+      ~/.cursor/mcp.json
+      ```
 
 ### Windows Compatibility
 

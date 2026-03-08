@@ -20,6 +20,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"whatsapp-bridge/auth"
+	"whatsapp-bridge/config"
 
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/socket"
@@ -100,57 +102,18 @@ type MessageStore struct {
 	db *sql.DB
 }
 
-type dbConfig struct {
-	User       string
-	Pass       string
-	Host       string
-	Port       string
-	IsPostgres bool
-}
-
 var isPostgres = false
-
-func getEnv() (*dbConfig, error) {
-	user, ok := os.LookupEnv("POSTGRES_USER")
-	if !ok {
-		return nil, fmt.Errorf("missing POSTGRES_USER")
-	}
-	pass, ok := os.LookupEnv("POSTGRES_PASS")
-	if !ok {
-		return nil, fmt.Errorf("missing POSTGRES_PASS")
-	}
-	host, ok := os.LookupEnv("POSTGRES_HOST")
-	if !ok {
-		return nil, fmt.Errorf("missing POSTGRES_HOST")
-	}
-	port, ok := os.LookupEnv("POSTGRES_PORT")
-	if !ok {
-		return nil, fmt.Errorf("missing POSTGRES_PORT")
-	}
-	IsPostgres, ok := os.LookupEnv("IS_POSTGRES")
-	if !ok {
-		IsPostgres = "false"
-	}
-
-	isPostgres = IsPostgres == "true"
-
-	return &dbConfig{
-		User:       user,
-		Pass:       pass,
-		Host:       host,
-		Port:       port,
-		IsPostgres: isPostgres,
-	}, nil
-}
 
 func openDatabase(dbName string) (*sql.DB, error) {
 	if val, ok := os.LookupEnv("IS_POSTGRES"); ok && strings.ToLower(val) == "true" {
-		config, err := getEnv()
+		cfg, err := config.LoadConfig()
 		if err != nil {
 			return nil, fmt.Errorf("missing environment variable")
 		}
+		isPostgres = cfg.DB.IsPostgres
 
-		connStr := fmt.Sprintf("postgresql://%s:%s@%s:%s/%s?sslmode=disable", config.User, config.Pass, config.Host, config.Port, dbName)
+		connStr := fmt.Sprintf("postgresql://%s:%s@%s:%s/%s?sslmode=disable",
+			cfg.DB.User, cfg.DB.Pass, cfg.DB.Host, cfg.DB.Port, dbName)
 		log.Println("Connecting to postgres")
 		return sql.Open("postgres", connStr)
 	}
@@ -861,8 +824,11 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, cfg *config.Config) {
+	apiMux := http.NewServeMux()
+
+	// Send message
+	apiMux.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -901,7 +867,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	apiMux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -945,7 +911,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// List recent chats
-	http.HandleFunc("/api/chats", func(w http.ResponseWriter, r *http.Request) {
+	apiMux.HandleFunc("/chats", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -981,13 +947,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Get single chat
-	http.HandleFunc("/api/chats/", func(w http.ResponseWriter, r *http.Request) {
+	apiMux.HandleFunc("/chats/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		jid := strings.TrimPrefix(r.URL.Path, "/api/chats/")
+		jid := strings.TrimPrefix(r.URL.Path, "/chats/")
 		if jid == "" {
 			http.Error(w, "Missing chat JID", http.StatusBadRequest)
 			return
@@ -1009,7 +975,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// List messages (very flexible)
-	http.HandleFunc("/api/messages", func(w http.ResponseWriter, r *http.Request) {
+	apiMux.HandleFunc("/messages", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1065,13 +1031,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Get message + context
-	http.HandleFunc("/api/messages/context/", func(w http.ResponseWriter, r *http.Request) {
+	apiMux.HandleFunc("/messages/context/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		messageID := strings.TrimPrefix(r.URL.Path, "/api/messages/context/")
+		messageID := strings.TrimPrefix(r.URL.Path, "/messages/context/")
 		if messageID == "" {
 			http.Error(w, "Missing message ID", http.StatusBadRequest)
 			return
@@ -1096,7 +1062,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Search contacts
-	http.HandleFunc("/api/contacts/search", func(w http.ResponseWriter, r *http.Request) {
+	apiMux.HandleFunc("/contacts/search", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1119,15 +1085,15 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// GET /api/contacts/:phone/chat
+	// GET /api/direct-contacts/:phone/chat
 	// Find the 1:1 (direct) chat for a given phone number
-	http.HandleFunc("/api/direct-contacts/", func(w http.ResponseWriter, r *http.Request) {
+	apiMux.HandleFunc("/direct-contacts/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		path := strings.TrimPrefix(r.URL.Path, "/api/direct-contacts/")
+		path := strings.TrimPrefix(r.URL.Path, "/direct-contacts/")
 		parts := strings.Split(path, "/")
 		if len(parts) < 2 || parts[1] != "chat" {
 			http.Error(w, "Invalid path. Use /api/direct-contacts/{phone}/chat", http.StatusBadRequest)
@@ -1159,13 +1125,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// GET /api/contacts/:jid/chats
 	// List all chats where this contact (by JID) appears as sender or in group
-	http.HandleFunc("/api/contacts/", func(w http.ResponseWriter, r *http.Request) {
+	apiMux.HandleFunc("/contacts/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		path := strings.TrimPrefix(r.URL.Path, "/api/contacts/")
+		path := strings.TrimPrefix(r.URL.Path, "/contacts/")
 		parts := strings.Split(path, "/")
 		if len(parts) < 2 || parts[1] != "chats" {
 			// Skip if not this endpoint (previous handler already took /chat)
@@ -1198,6 +1164,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			"count": len(chats),
 		})
 	})
+
+	// Authentication
+	protected := auth.JwtAuthMiddleware(cfg, apiMux)
+	http.Handle("/api/", http.StripPrefix("/api", protected))
+	http.Handle("/auth/login", auth.LoginHandler(cfg))
 
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -2362,7 +2333,7 @@ func main() {
 		return
 	}
 
-	config, err := getEnv()
+	cfg, err := config.LoadConfig()
 	if err != nil {
 		return
 	}
@@ -2370,10 +2341,10 @@ func main() {
 	dialect := "sqlite3"
 	connStr := "file:store/whatsapp.db?_foreign_keys=on"
 
-	if config.IsPostgres {
+	if cfg.DB.IsPostgres {
 		dialect = "postgres"
-		connStr = fmt.Sprintf("postgresql://%s:%s@%s:%s/%s?sslmode=disable", config.User,
-			config.Pass, config.Host, config.Port, "whatsapp")
+		connStr = fmt.Sprintf("postgresql://%s:%s@%s:%s/%s?sslmode=disable", cfg.DB.User,
+			cfg.DB.Pass, cfg.DB.Host, cfg.DB.Port, "whatsapp")
 	}
 
 	container, err := sqlstore.New(context.Background(), dialect, connStr, dbLog)
@@ -2477,7 +2448,7 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, 8080, cfg)
 
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)

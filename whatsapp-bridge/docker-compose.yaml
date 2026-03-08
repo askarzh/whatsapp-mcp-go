@@ -11,12 +11,16 @@ services:
       IS_POSTGRES: "true"
       POSTGRES_USER: "test"
       POSTGRES_PASS: "test"
-      POSTGRES_HOST: "192.168.1.100"
+      POSTGRES_HOST: "postgres"
       POSTGRES_PORT: "5432"
+      API_KEY: "c3VwZXItbG9uZy1yYW5kb20tc3RyaW5nLW1pbmltdW0tb2YtNjQtY2hhcmFjdGVycy15b3UtbmVlZC10by1wYXN0ZS1oZXJl"
+      JWT_SECRET: "YW5vdGhlci1zdXBlci1sb25nLXJhbmRvbS1zdHJpbmctbWluaW11bS1vZi02NC1jaGFyYWN0ZXJzLXlvdS1uZWVkLXRvLXBhc3RlLWhlcmU="
     ports:
       - "8080:8080"
     volumes:
       - media:/project/store
+    depends_on:
+      - postgres
     deploy:
       resources:
         limits:
@@ -25,6 +29,19 @@ services:
         reservations:
           cpus: "0.5"
           memory: "64M"
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    restart: always
+    environment:
+      POSTGRES_USER: "test"
+      POSTGRES_PASSWORD: "test"
+      POSTGRES_DB: "testdb"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
 
 volumes:
   media:
+  pgdata:
