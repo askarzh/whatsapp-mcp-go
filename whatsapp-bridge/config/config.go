@@ -57,6 +57,12 @@ func LoadConfig() (*Config, error) {
 	if !ok {
 		return nil, fmt.Errorf("missing WHATSAPP_API_KEY")
 	}
+	if err := validateSecret("WHATSAPP_JWT_SECRET", jwtSecret); err != nil {
+		return nil, err
+	}
+	if err := validateSecret("WHATSAPP_API_KEY", apiKey); err != nil {
+		return nil, err
+	}
 	webhookUrl := os.Getenv("WEBHOOK_URL")
 
 	serverHost := os.Getenv("HOST")
@@ -86,6 +92,27 @@ func LoadConfig() (*Config, error) {
 		Port:       serverPort,
 		LogLevel:   logLevel,
 	}, nil
+}
+
+const minSecretLen = 32
+
+// knownPlaceholders are the example values shipped in docker-compose.yaml.
+// Operators who forget to override them must see startup fail loudly.
+var knownPlaceholders = []string{
+	"c3VwZXItbG9uZy1yYW5kb20tc3RyaW5nLW1pbmltdW0tb2YtNjQtY2hhcmFjdGVycy15b3UtbmVlZC10by1wYXN0ZS1oZXJl",
+	"YW5vdGhlci1zdXBlci1sb25nLXJhbmRvbS1zdHJpbmctbWluaW11bS1vZi02NC1jaGFyYWN0ZXJzLXlvdS1uZWVkLXRvLXBhc3RlLWhlcmU=",
+}
+
+func validateSecret(name, value string) error {
+	for _, ph := range knownPlaceholders {
+		if value == ph {
+			return fmt.Errorf("%s is set to a placeholder value; generate a real one with `openssl rand -base64 48`", name)
+		}
+	}
+	if len(value) < minSecretLen {
+		return fmt.Errorf("%s is too short (%d chars, need ≥%d)", name, len(value), minSecretLen)
+	}
+	return nil
 }
 
 // envWarnFn is replaced in tests; in production it logs via slog.
