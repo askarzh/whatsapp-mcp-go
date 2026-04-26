@@ -16,7 +16,7 @@ func readApiBaseURL() string {
 		return v
 	}
 	const fallback = "http://localhost:8080/api"
-	slog.Warn("API_BASE_URL is unset, falling back to default", "fallback", fallback)
+	slog.Warn("api_base_url not set, using default", "fallback", fallback)
 	return fallback
 }
 

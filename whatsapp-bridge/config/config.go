@@ -22,7 +22,6 @@ type Config struct {
 	WebhookUrl    string
 	Host          string
 	Port          int
-	LogLevel      string
 	AuthLoginRate string
 }
 
@@ -58,10 +57,10 @@ func LoadConfig() (*Config, error) {
 	if !ok {
 		return nil, fmt.Errorf("missing WHATSAPP_API_KEY")
 	}
-	if err := validateSecret("WHATSAPP_JWT_SECRET", jwtSecret); err != nil {
+	if err := validateSecret("WHATSAPP_JWT_SECRET (or deprecated alias JWT_SECRET)", jwtSecret); err != nil {
 		return nil, err
 	}
-	if err := validateSecret("WHATSAPP_API_KEY", apiKey); err != nil {
+	if err := validateSecret("WHATSAPP_API_KEY (or deprecated alias API_KEY)", apiKey); err != nil {
 		return nil, err
 	}
 	webhookUrl := os.Getenv("WEBHOOK_URL")
@@ -75,8 +74,6 @@ func LoadConfig() (*Config, error) {
 		}
 		serverPort = p
 	}
-
-	logLevel := os.Getenv("LOG_LEVEL")
 
 	authLoginRate := os.Getenv("AUTH_LOGIN_RATE") // parsed in auth package; empty -> default
 
@@ -93,7 +90,6 @@ func LoadConfig() (*Config, error) {
 		WebhookUrl:    webhookUrl,
 		Host:          serverHost,
 		Port:          serverPort,
-		LogLevel:      logLevel,
 		AuthLoginRate: authLoginRate,
 	}, nil
 }

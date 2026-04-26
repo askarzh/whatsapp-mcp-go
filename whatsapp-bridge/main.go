@@ -2381,14 +2381,13 @@ func main() {
 		return
 	}
 
+	slog.SetDefault(bridgelogger.New(os.Getenv("LOG_LEVEL")))
+
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		logger.Errorf("Failed to load config: %v", err)
 		return
 	}
-
-	log := bridgelogger.New(cfg.LogLevel)
-	slog.SetDefault(log)
 
 	dialect := "sqlite3"
 	connStr := "file:store/whatsapp.db?_foreign_keys=on"
