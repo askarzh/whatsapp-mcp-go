@@ -2,6 +2,7 @@
 whatsapp-bridge/store/
 whatsapp-bridge/whatsapp-bridge
 whatsapp-mcp-server/whatsapp-mcp
+whatsapp-mcp-server/whatsapp-mcp-server
 
 # Go build / test output
 *.exe
