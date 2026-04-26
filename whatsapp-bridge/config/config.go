@@ -21,6 +21,7 @@ type Config struct {
 	WebhookUrl string
 	Host       string
 	Port       int
+	LogLevel   string
 }
 
 func LoadConfig() (*Config, error) {
@@ -67,6 +68,8 @@ func LoadConfig() (*Config, error) {
 		serverPort = p
 	}
 
+	logLevel := os.Getenv("LOG_LEVEL")
+
 	return &Config{
 		DB: dbConfig{
 			User:       user,
@@ -80,5 +83,6 @@ func LoadConfig() (*Config, error) {
 		WebhookUrl: webhookUrl,
 		Host:       serverHost,
 		Port:       serverPort,
+		LogLevel:   logLevel,
 	}, nil
 }
