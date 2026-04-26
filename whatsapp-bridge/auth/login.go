@@ -1,8 +1,9 @@
 package auth
 
 import (
+	"crypto/subtle"
 	"encoding/json"
-	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -18,10 +19,11 @@ type Claims struct {
 
 func LoginHandler(cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
+		expected := []byte("Bearer " + cfg.APIKey)
+		got := []byte(r.Header.Get("Authorization"))
 
-		if auth != fmt.Sprintf("Bearer %s", cfg.APIKey) {
-			fmt.Println("Invalid API key")
+		if subtle.ConstantTimeCompare(expected, got) != 1 {
+			slog.Warn("login rejected: bad api key", "remote", r.RemoteAddr)
 			http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 			return
 		}
@@ -37,7 +39,7 @@ func LoginHandler(cfg *config.Config) http.HandlerFunc {
 		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 		signed, err := token.SignedString(cfg.JWTSecret)
 		if err != nil {
-			fmt.Println("Failed to sign token:", err)
+			slog.Error("failed to sign token", "err", err)
 			http.Error(w, "Failed to generate token", http.StatusInternalServerError)
 			return
 		}
@@ -62,13 +64,13 @@ func JwtAuthMiddleware(cfg *config.Config, next http.Handler) http.Handler {
 		})
 
 		if err != nil {
-			fmt.Println("Parse error:", err)
+			slog.Warn("jwt parse error", "err", err, "remote", r.RemoteAddr)
 			http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
 			return
 		}
 
 		if !token.Valid {
-			fmt.Println("Token is NOT valid")
+			slog.Warn("jwt invalid", "remote", r.RemoteAddr)
 			http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
 			return
 		}
