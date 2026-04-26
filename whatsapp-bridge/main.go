@@ -32,6 +32,7 @@ import (
 	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
+	qrcode "github.com/skip2/go-qrcode"
 
 	"bytes"
 
@@ -2484,7 +2485,11 @@ func main() {
 				case "code":
 					fmt.Println("\nScan this QR code with your WhatsApp app:")
 					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-					// C2 will populate state.SetPairingQRPNG(...) here.
+					if png, err := qrcode.Encode(evt.Code, qrcode.Medium, 256); err == nil {
+						state.SetPairingQRPNG(png)
+					} else {
+						slog.Warn("failed to encode pairing qr as png", "err", err)
+					}
 				case "success":
 					fmt.Println("\nSuccessfully connected and authenticated!")
 					return
