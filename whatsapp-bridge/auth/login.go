@@ -31,8 +31,9 @@ func LoginHandler(cfg *config.Config) http.HandlerFunc {
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := clientIP(r)
-		if !limiter.get(ip).Allow() {
-			retry := retryAfterSeconds(limiter.get(ip))
+		lim := limiter.get(ip)
+		if !lim.Allow() {
+			retry := retryAfterSeconds(lim)
 			w.Header().Set("Retry-After", strconv.Itoa(retry))
 			slog.Warn("login rate-limited", "remote", ip)
 			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)

@@ -16,10 +16,10 @@ type dbConfig struct {
 }
 
 type Config struct {
-	DB         dbConfig
-	JWTSecret  []byte
-	APIKey     string
-	WebhookUrl string
+	DB            dbConfig
+	JWTSecret     []byte
+	APIKey        string
+	WebhookUrl    string
 	Host          string
 	Port          int
 	LogLevel      string
@@ -88,11 +88,11 @@ func LoadConfig() (*Config, error) {
 			Port:       port,
 			IsPostgres: isPostgres,
 		},
-		JWTSecret:  []byte(jwtSecret),
-		APIKey:     apiKey,
-		WebhookUrl: webhookUrl,
-		Host:       serverHost,
-		Port:       serverPort,
+		JWTSecret:     []byte(jwtSecret),
+		APIKey:        apiKey,
+		WebhookUrl:    webhookUrl,
+		Host:          serverHost,
+		Port:          serverPort,
 		LogLevel:      logLevel,
 		AuthLoginRate: authLoginRate,
 	}, nil
