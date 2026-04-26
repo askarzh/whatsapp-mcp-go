@@ -49,13 +49,13 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
-	jwtSecret, ok := os.LookupEnv("JWT_SECRET")
+	jwtSecret, ok := lookupEither("WHATSAPP_JWT_SECRET", "JWT_SECRET")
 	if !ok {
-		return nil, fmt.Errorf("missing JWT_SECRET")
+		return nil, fmt.Errorf("missing WHATSAPP_JWT_SECRET")
 	}
-	apiKey, ok := os.LookupEnv("API_KEY")
+	apiKey, ok := lookupEither("WHATSAPP_API_KEY", "API_KEY")
 	if !ok {
-		return nil, fmt.Errorf("missing API_KEY")
+		return nil, fmt.Errorf("missing WHATSAPP_API_KEY")
 	}
 	webhookUrl := os.Getenv("WEBHOOK_URL")
 
