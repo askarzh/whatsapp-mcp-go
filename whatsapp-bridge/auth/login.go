@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"whatsapp-bridge/config"
@@ -18,7 +19,25 @@ type Claims struct {
 }
 
 func LoginHandler(cfg *config.Config) http.HandlerFunc {
+	limiter, err := newLoginLimiter(cfg.AuthLoginRate)
+	if err != nil {
+		// Surface fatal config error at startup by returning a handler that always 500s.
+		// In practice main() should call newLoginLimiter directly and exit, but keeping
+		// the existing LoginHandler signature stable avoids a wider refactor in this PR.
+		slog.Error("invalid AUTH_LOGIN_RATE", "err", err)
+		return func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "server misconfigured", http.StatusInternalServerError)
+		}
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
+		ip := clientIP(r)
+		if !limiter.get(ip).Allow() {
+			retry := retryAfterSeconds(limiter.get(ip))
+			w.Header().Set("Retry-After", strconv.Itoa(retry))
+			slog.Warn("login rate-limited", "remote", ip)
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return
+		}
 		expected := []byte("Bearer " + cfg.APIKey)
 		got := []byte(r.Header.Get("Authorization"))
 

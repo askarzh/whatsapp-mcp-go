@@ -20,9 +20,10 @@ type Config struct {
 	JWTSecret  []byte
 	APIKey     string
 	WebhookUrl string
-	Host       string
-	Port       int
-	LogLevel   string
+	Host          string
+	Port          int
+	LogLevel      string
+	AuthLoginRate string
 }
 
 func LoadConfig() (*Config, error) {
@@ -77,6 +78,8 @@ func LoadConfig() (*Config, error) {
 
 	logLevel := os.Getenv("LOG_LEVEL")
 
+	authLoginRate := os.Getenv("AUTH_LOGIN_RATE") // parsed in auth package; empty -> default
+
 	return &Config{
 		DB: dbConfig{
 			User:       user,
@@ -90,7 +93,8 @@ func LoadConfig() (*Config, error) {
 		WebhookUrl: webhookUrl,
 		Host:       serverHost,
 		Port:       serverPort,
-		LogLevel:   logLevel,
+		LogLevel:      logLevel,
+		AuthLoginRate: authLoginRate,
 	}, nil
 }
 
