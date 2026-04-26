@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 )
@@ -85,4 +86,25 @@ func LoadConfig() (*Config, error) {
 		Port:       serverPort,
 		LogLevel:   logLevel,
 	}, nil
+}
+
+// envWarnFn is replaced in tests; in production it logs via slog.
+var envWarnFn = func(msg string, args ...any) {
+	slog.Warn(msg, args...)
+}
+
+// lookupEither returns the value for `primary` if set, otherwise falls back
+// to `deprecated` and emits a deprecation warning. Returns ("", false) only
+// when neither is set.
+func lookupEither(primary, deprecated string) (string, bool) {
+	if v, ok := os.LookupEnv(primary); ok {
+		return v, true
+	}
+	if v, ok := os.LookupEnv(deprecated); ok {
+		envWarnFn("env var is deprecated, use the new name",
+			"deprecated", deprecated,
+			"use_instead", primary)
+		return v, true
+	}
+	return "", false
 }
