@@ -90,12 +90,43 @@ If you're running this project on Windows, be aware that `go-sqlite3` requires *
    go run main.go # or use this to enabled webhook and http streaming, `WEBHOOK_URL=http://192.168.178.119:5777/sse IS_HTTP=true go run main.go`
    ```
 
-OR
+### Or run everything in Docker
 
-Simply use dokcer compose to do all the job for you
+The repo ships a `docker-compose.yaml` at the root that brings up three
+services: `postgres`, `wa-bridge`, and `wa-mcp`. The MCP server is
+started in **HTTP mode** (port 5777) because that is the only mode that
+fits a long-running container — see "MCP server: stdio vs HTTP" below
+for when to use each.
+
 ```bash
+# 1. Set the four required vars (in .env at repo root, or in your shell)
+cat > .env <<EOF
+WHATSAPP_API_KEY=$(openssl rand -base64 48)
+WHATSAPP_JWT_SECRET=$(openssl rand -base64 48)
+POSTGRES_USER=whatsapp
+POSTGRES_PASS=$(openssl rand -base64 24)
+EOF
+
+# 2. Bring it all up
 docker compose up
 ```
+
+Once running:
+- Bridge REST API: `http://localhost:8080/api/...` (after `/auth/login`)
+- MCP HTTP endpoint: `http://localhost:5777`
+
+### MCP server: stdio vs HTTP
+
+The MCP server has two run modes selected by `IS_HTTP`:
+
+| Mode | When to use | How to launch |
+| --- | --- | --- |
+| **stdio** (`IS_HTTP=false`, default) | Claude Desktop, Cursor, or any host that spawns the MCP server as a child process | `go build` a local binary; reference it from `claude_desktop_config.json` / `mcp.json` (see below) |
+| **HTTP** (`IS_HTTP=true`) | n8n, web automation, or any client connecting over the network | `docker compose up` — the `wa-mcp` service runs in HTTP mode by default, listening on `:5777` |
+
+Stdio mode is **not** appropriate for the Docker image — Claude Desktop
+does not natively `docker run` to spawn an MCP child. Build a local
+binary instead.
 
 ## Authentication
 
