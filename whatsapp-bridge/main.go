@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"whatsapp-bridge/auth"
@@ -2474,6 +2475,10 @@ func main() {
 
 	state.SetLoggedIn(client.Store.ID != nil) // existing session means already logged in
 
+	const maxOutdatedRetries = 3
+	var outdatedRetries int
+	var outdatedRetriesMu sync.Mutex
+
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
@@ -2487,6 +2492,9 @@ func main() {
 			state.SetConnected(true)
 			state.SetLoggedIn(true)
 			state.ClearPairingQR()
+			outdatedRetriesMu.Lock()
+			outdatedRetries = 0
+			outdatedRetriesMu.Unlock()
 
 		case *events.Disconnected:
 			logger.Warnf("Disconnected from WhatsApp")
@@ -2496,6 +2504,34 @@ func main() {
 			logger.Warnf("Device logged out, please scan QR code to log in again")
 			state.SetLoggedIn(false)
 			state.SetConnected(false)
+
+		case *events.ClientOutdated:
+			outdatedRetriesMu.Lock()
+			outdatedRetries++
+			n := outdatedRetries
+			outdatedRetriesMu.Unlock()
+			state.SetConnected(false)
+			if n > maxOutdatedRetries {
+				slog.Error("client outdated: exceeded retry budget; whatsmeow library likely needs a real upgrade",
+					"retries", n, "max", maxOutdatedRetries)
+				return
+			}
+			slog.Warn("client outdated (405); refreshing wa version and reconnecting",
+				"attempt", n, "max", maxOutdatedRetries)
+			go func() {
+				time.Sleep(5 * time.Second)
+				newVersion, err := CustomGetLatestVersion(context.Background(), nil)
+				if err != nil {
+					slog.Error("failed to refresh wa version", "err", err)
+					return
+				}
+				store.SetWAVersion(*newVersion)
+				state.SetWAVersion(fmt.Sprintf("%d.%d.%d", newVersion[0], newVersion[1], newVersion[2]))
+				slog.Info("applied refreshed wa version, attempting reconnect", "version", state.WAVersion())
+				if err := client.Connect(); err != nil {
+					slog.Error("reconnect after wa version refresh failed", "err", err)
+				}
+			}()
 		}
 	})
 
