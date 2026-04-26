@@ -31,6 +31,8 @@ func LoginHandler(cfg *config.Config) http.HandlerFunc {
 		claims := Claims{
 			Service: "mcp-server",
 			RegisteredClaims: jwt.RegisteredClaims{
+				Issuer:    "whatsapp-bridge",
+				Audience:  []string{"whatsapp-mcp-server"},
 				ExpiresAt: jwt.NewNumericDate(time.Now().Add(45 * time.Minute)),
 				IssuedAt:  jwt.NewNumericDate(time.Now()),
 			},
@@ -59,9 +61,16 @@ func JwtAuthMiddleware(cfg *config.Config, next http.Handler) http.Handler {
 
 		tokenStr := strings.TrimPrefix(auth, "Bearer ")
 
-		token, err := jwt.ParseWithClaims(tokenStr, &Claims{}, func(token *jwt.Token) (interface{}, error) {
-			return cfg.JWTSecret, nil
-		})
+		token, err := jwt.ParseWithClaims(
+			tokenStr,
+			&Claims{},
+			func(token *jwt.Token) (interface{}, error) {
+				return cfg.JWTSecret, nil
+			},
+			jwt.WithIssuer("whatsapp-bridge"),
+			jwt.WithAudience("whatsapp-mcp-server"),
+			jwt.WithValidMethods([]string{"HS256"}),
+		)
 
 		if err != nil {
 			slog.Warn("jwt parse error", "err", err, "remote", r.RemoteAddr)
