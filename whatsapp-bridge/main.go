@@ -2539,6 +2539,27 @@ func main() {
 	// are reachable during pairing. WhatsApp connect runs concurrently below.
 	startRESTServer(client, messageStore, cfg, state)
 
+	// Periodically refresh the WhatsApp Web client version so reconnects
+	// after transient drops use a current version string. Only the next
+	// connection picks up the refreshed value; the active session is unaffected.
+	go func() {
+		t := time.NewTicker(6 * time.Hour)
+		defer t.Stop()
+		for range t.C {
+			v, err := CustomGetLatestVersion(context.Background(), nil)
+			if err != nil {
+				slog.Warn("periodic wa version refresh failed", "err", err)
+				continue
+			}
+			store.SetWAVersion(*v)
+			next := fmt.Sprintf("%d.%d.%d", v[0], v[1], v[2])
+			if next != state.WAVersion() {
+				slog.Info("wa version updated by periodic refresh", "from", state.WAVersion(), "to", next)
+				state.SetWAVersion(next)
+			}
+		}
+	}()
+
 	// Pair / connect to WhatsApp in a goroutine so main can block on signals.
 	go func() {
 		if client.Store.ID == nil {
