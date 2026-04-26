@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 )
 
 type dbConfig struct {
@@ -18,24 +19,32 @@ type Config struct {
 	JWTSecret  []byte
 	APIKey     string
 	WebhookUrl string
+	Host       string
+	Port       int
 }
 
 func LoadConfig() (*Config, error) {
-	user, ok := os.LookupEnv("POSTGRES_USER")
-	if !ok {
-		return nil, fmt.Errorf("missing POSTGRES_USER")
-	}
-	pass, ok := os.LookupEnv("POSTGRES_PASS")
-	if !ok {
-		return nil, fmt.Errorf("missing POSTGRES_PASS")
-	}
-	host, ok := os.LookupEnv("POSTGRES_HOST")
-	if !ok {
-		return nil, fmt.Errorf("missing POSTGRES_HOST")
-	}
-	port, ok := os.LookupEnv("POSTGRES_PORT")
-	if !ok {
-		return nil, fmt.Errorf("missing POSTGRES_PORT")
+	isPostgres := os.Getenv("IS_POSTGRES") == "true"
+
+	var user, pass, host, port string
+	if isPostgres {
+		var ok bool
+		user, ok = os.LookupEnv("POSTGRES_USER")
+		if !ok {
+			return nil, fmt.Errorf("missing POSTGRES_USER")
+		}
+		pass, ok = os.LookupEnv("POSTGRES_PASS")
+		if !ok {
+			return nil, fmt.Errorf("missing POSTGRES_PASS")
+		}
+		host, ok = os.LookupEnv("POSTGRES_HOST")
+		if !ok {
+			return nil, fmt.Errorf("missing POSTGRES_HOST")
+		}
+		port, ok = os.LookupEnv("POSTGRES_PORT")
+		if !ok {
+			return nil, fmt.Errorf("missing POSTGRES_PORT")
+		}
 	}
 
 	jwtSecret, ok := os.LookupEnv("JWT_SECRET")
@@ -48,7 +57,15 @@ func LoadConfig() (*Config, error) {
 	}
 	webhookUrl := os.Getenv("WEBHOOK_URL")
 
-	isPostgres := os.Getenv("IS_POSTGRES") == "true"
+	serverHost := os.Getenv("HOST")
+	serverPort := 8080
+	if v, ok := os.LookupEnv("PORT"); ok {
+		p, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid PORT %q: %w", v, err)
+		}
+		serverPort = p
+	}
 
 	return &Config{
 		DB: dbConfig{
@@ -58,8 +75,10 @@ func LoadConfig() (*Config, error) {
 			Port:       port,
 			IsPostgres: isPostgres,
 		},
-		JWTSecret: []byte(jwtSecret),
-		APIKey:    apiKey,
+		JWTSecret:  []byte(jwtSecret),
+		APIKey:     apiKey,
 		WebhookUrl: webhookUrl,
+		Host:       serverHost,
+		Port:       serverPort,
 	}, nil
 }

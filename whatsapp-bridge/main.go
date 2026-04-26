@@ -872,7 +872,7 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, cfg *config.Config) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *config.Config) {
 	apiMux := http.NewServeMux()
 
 	// Send message
@@ -1218,7 +1218,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	http.Handle("/api/", http.StripPrefix("/api", protected))
 	http.Handle("/auth/login", auth.LoginHandler(cfg))
 
-	serverAddr := fmt.Sprintf(":%d", port)
+	serverAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	go func() {
@@ -2383,6 +2383,7 @@ func main() {
 
 	cfg, err := config.LoadConfig()
 	if err != nil {
+		logger.Errorf("Failed to load config: %v", err)
 		return
 	}
 
@@ -2496,7 +2497,7 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	startRESTServer(client, messageStore, 8080, cfg)
+	startRESTServer(client, messageStore, cfg)
 
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
