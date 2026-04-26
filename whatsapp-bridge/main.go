@@ -1217,6 +1217,18 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		})
 	})
 
+	apiMux.HandleFunc("/auth/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]bool{
+			"connected":        state.Connected(),
+			"logged_in":        state.LoggedIn(),
+			"pairing_required": state.PairingRequired(),
+		})
+	})
+
 	// Authentication
 	protected := auth.JwtAuthMiddleware(cfg, apiMux)
 	http.Handle("/api/", http.StripPrefix("/api", protected))
