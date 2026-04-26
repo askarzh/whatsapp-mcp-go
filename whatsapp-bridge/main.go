@@ -1229,6 +1229,22 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		})
 	})
 
+	apiMux.HandleFunc("/auth/pairing-qr", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		png := state.PairingQRPNG()
+		if png == nil {
+			http.Error(w, "no pairing QR available; client is logged in or has not started pairing yet", http.StatusGone)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(png)
+	})
+
 	// Authentication
 	protected := auth.JwtAuthMiddleware(cfg, apiMux)
 	http.Handle("/api/", http.StripPrefix("/api", protected))
