@@ -49,7 +49,7 @@ Start `whatsapp-bridge` -> then run `whatsapp-mcp-server` in your preferred mode
                "whatsapp-mcp": {
                   "command": "{{PROJECT_BASE_PATH}}/whatsapp-mcp-server/whatsapp-mcp",
                   "env": {
-                       "WHATSAPP_API_SECRET": "c3VwZXItbG9uZy1yYW5kb20tc3RyaW5nLW1pbmltdW0tb2YtNjQtY2hhcmFjdGVycy15b3UtbmVlZC10by1wYXN0ZS1oZXJl"
+                       "WHATSAPP_API_KEY": "c3VwZXItbG9uZy1yYW5kb20tc3RyaW5nLW1pbmltdW0tb2YtNjQtY2hhcmFjdGVycy15b3UtbmVlZC10by1wYXN0ZS1oZXJl"
                   }
                }
            },
@@ -99,18 +99,36 @@ docker compose up
 
 ## Authentication
 
-The HTTP API is protected using **API Key or JWT authentication**.
+The HTTP API is protected by a two-step **API key → JWT** flow.
 
-You must include one of the following headers in every request.
+1. Send your static API key to `/auth/login` once. The bridge returns a 45-minute JWT.
+2. Use the JWT as `Authorization: Bearer <jwt>` on every `/api/...` call.
 
-### API Key
+### Step 1: Get a JWT
 
-Authorization: ApiKey <your-api-key>
+```bash
+curl -X POST \
+  -H "Authorization: Bearer $WHATSAPP_API_KEY" \
+  http://localhost:8080/auth/login
+# {"token":"eyJhbGciOiJIUzI1NiIs..."}
+```
 
-Example:
+### Step 2: Call the API
 
-curl -H "Authorization: ApiKey your-api-key" \
-http://localhost:8080/messages
+```bash
+TOKEN=eyJhbGciOiJIUzI1NiIs...
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/chats
+```
+
+The MCP server does this automatically: configure `WHATSAPP_API_KEY` and it
+fetches/refreshes JWTs as needed.
+
+### Rate limiting
+
+`/auth/login` is rate-limited per client IP (default: 5 attempts / minute).
+Override with `AUTH_LOGIN_RATE=<count>/<window>` (e.g. `10/30s`). Behind a
+reverse proxy, terminate rate limiting upstream — the bridge currently uses
+`r.RemoteAddr` and does not consult `X-Forwarded-For`.
 
 ## Architecture Overview
 

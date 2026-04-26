@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"math"
 	"math/rand"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 	"time"
 	"whatsapp-bridge/auth"
 	"whatsapp-bridge/config"
+	bridgelogger "whatsapp-bridge/logger"
 
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/socket"
@@ -441,7 +443,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
 
-		fmt.Println("Media uploaded", resp)
+		slog.Info("media uploaded", "response", resp)
 
 		switch mediaType {
 		case whatsmeow.MediaImage:
@@ -468,7 +470,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
 				}
 			} else {
-				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
+				slog.Warn("not an Ogg Opus file", "mime_type", mimeType)
 			}
 
 			msg.AudioMessage = &waE2E.AudioMessage{
@@ -647,9 +649,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 
 		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			slog.Info("message", "ts", timestamp, "direction", direction, "sender", sender, "media_type", mediaType, "filename", filename, "content", content)
 		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			slog.Info("message", "ts", timestamp, "direction", direction, "sender", sender, "content", content)
 		}
 	}
 }
@@ -814,7 +816,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("incomplete media information for download")
 	}
 
-	fmt.Printf("Attempting to download media for message %s in chat %s...\n", messageID, chatJID)
+	slog.Info("attempting to download media", "message_id", messageID, "chat_jid", chatJID)
 
 	directPath := extractDirectPathFromURL(url)
 
@@ -851,7 +853,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
-	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
+	slog.Info("successfully downloaded media", "media_type", mediaType, "path", absPath, "bytes", len(mediaData))
 	return true, mediaType, filename, absPath, nil
 }
 
@@ -872,7 +874,7 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, cfg *config.Config) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *config.Config) {
 	apiMux := http.NewServeMux()
 
 	// Send message
@@ -898,10 +900,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+		slog.Info("received request to send message", "message", req.Message, "media_path", req.MediaPath)
 
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
+		slog.Info("message sent", "success", success, "message", message)
 		w.Header().Set("Content-Type", "application/json")
 
 		if !success {
@@ -1218,12 +1220,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	http.Handle("/api/", http.StripPrefix("/api", protected))
 	http.Handle("/auth/login", auth.LoginHandler(cfg))
 
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	serverAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	slog.Info("starting REST API server", "addr", serverAddr)
 
 	go func() {
 		if err := http.ListenAndServe(serverAddr, nil); err != nil {
-			fmt.Printf("REST API server error: %v\n", err)
+			slog.Error("rest api server error", "err", err)
 		}
 	}()
 }
@@ -1308,7 +1310,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
-	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
+	slog.Info("received history sync event", "conversations", len(historySync.Data.Conversations))
 
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
@@ -1430,29 +1432,29 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		}
 	}
 
-	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+	slog.Info("history sync complete", "stored_messages", syncedCount)
 }
 
 // Request history sync from the server
 func requestHistorySync(client *whatsmeow.Client) {
 	if client == nil {
-		fmt.Println("Client is not initialized. Cannot request history sync.")
+		slog.Error("client is not initialized, cannot request history sync")
 		return
 	}
 
 	if !client.IsConnected() {
-		fmt.Println("Client is not connected. Please ensure you are connected to WhatsApp first.")
+		slog.Warn("client is not connected to whatsapp")
 		return
 	}
 
 	if client.Store.ID == nil {
-		fmt.Println("Client is not logged in. Please scan the QR code first.")
+		slog.Warn("client is not logged in, please scan the qr code")
 		return
 	}
 
 	historyMsg := client.BuildHistorySyncRequest(nil, 100)
 	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
+		slog.Error("failed to build history sync request")
 		return
 	}
 
@@ -1462,9 +1464,9 @@ func requestHistorySync(client *whatsmeow.Client) {
 	}, historyMsg)
 
 	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
+		slog.Error("failed to request history sync", "err", err)
 	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
+		slog.Info("history sync requested, waiting for server response")
 	}
 }
 
@@ -1515,7 +1517,7 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 					preSkip = binary.LittleEndian.Uint16(pageData[headPos+10 : headPos+12])
 					sampleRate = binary.LittleEndian.Uint32(pageData[headPos+12 : headPos+16])
 					foundOpusHead = true
-					fmt.Printf("Found OpusHead: sampleRate=%d, preSkip=%d\n", sampleRate, preSkip)
+					slog.Info("found OpusHead", "sample_rate", sampleRate, "pre_skip", preSkip)
 				}
 			}
 		}
@@ -1528,16 +1530,15 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 	}
 
 	if !foundOpusHead {
-		fmt.Println("Warning: OpusHead not found, using default values")
+		slog.Warn("opushead not found, using default values")
 	}
 
 	if lastGranule > 0 {
 		durationSeconds := float64(lastGranule-uint64(preSkip)) / float64(sampleRate)
 		duration = uint32(math.Ceil(durationSeconds))
-		fmt.Printf("Calculated Opus duration from granule: %f seconds (lastGranule=%d)\n",
-			durationSeconds, lastGranule)
+		slog.Info("calculated Opus duration from granule", "duration_seconds", durationSeconds, "last_granule", lastGranule)
 	} else {
-		fmt.Println("Warning: No valid granule position found, using estimation")
+		slog.Warn("no valid granule position found, using estimation")
 		durationEstimate := float64(len(data)) / 2000.0
 		duration = uint32(durationEstimate)
 	}
@@ -1550,8 +1551,7 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 
 	waveform = placeholderWaveform(duration)
 
-	fmt.Printf("Ogg Opus analysis: size=%d bytes, calculated duration=%d sec, waveform=%d bytes\n",
-		len(data), duration, len(waveform))
+	slog.Info("ogg opus analysis complete", "size_bytes", len(data), "duration_sec", duration, "waveform_bytes", len(waveform))
 
 	return duration, waveform, nil
 }
@@ -2381,8 +2381,11 @@ func main() {
 		return
 	}
 
+	slog.SetDefault(bridgelogger.New(os.Getenv("LOG_LEVEL")))
+
 	cfg, err := config.LoadConfig()
 	if err != nil {
+		logger.Errorf("Failed to load config: %v", err)
 		return
 	}
 
@@ -2496,7 +2499,7 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	startRESTServer(client, messageStore, 8080, cfg)
+	startRESTServer(client, messageStore, cfg)
 
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
