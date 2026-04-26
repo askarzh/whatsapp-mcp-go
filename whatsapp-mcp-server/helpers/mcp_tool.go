@@ -82,6 +82,11 @@ func InitMcpTool() {
 		Description: "Download media from a WhatsApp message and return local file path.",
 	}, downloadMediaHandler)
 
+	mcp.AddTool[getLoginStatusInput, any](server, &mcp.Tool{
+		Name:        "get_login_status",
+		Description: "Check whether the WhatsApp bridge is connected and logged in. Returns {connected, logged_in, pairing_required}.",
+	}, getLoginStatusHandler)
+
 	isHttp := strings.ToLower(ReadEnv("IS_HTTP", "false")) == "true" ||
 		strings.ToLower(ReadEnv("IS_HTTP", "0")) == "1"
 
@@ -174,6 +179,8 @@ type downloadMediaInput struct {
 	MessageID string `json:"message_id"`
 	ChatJid   string `json:"chat_jid"`
 }
+
+type getLoginStatusInput struct{}
 
 func callAPI(method, path string, body any) ([]byte, error) {
 	token, err := GetOrRefreshJwtToken()
@@ -555,4 +562,18 @@ func sendAudioMessageHandler(ctx context.Context,
 	resultData := map[string]any{"success": success, "message": msg}
 
 	return &mcp.CallToolResult{IsError: !success}, resultData, nil
+}
+
+func getLoginStatusHandler(
+	ctx context.Context,
+	req *mcp.CallToolRequest,
+	_ getLoginStatusInput,
+) (*mcp.CallToolResult, any, error) {
+	data, err := callAPI(http.MethodGet, "/auth/status", nil)
+	if err != nil {
+		return ErrResult(fmt.Sprintf("failed to fetch login status: %v", err)), nil, nil
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: string(data)}},
+	}, nil, nil
 }
