@@ -2,13 +2,15 @@ package wastate
 
 import "sync"
 
-// State tracks the WhatsApp client's connection + login state and the
-// current pairing QR PNG bytes (populated only while pairing is required).
+// State tracks the WhatsApp client's connection + login state, the
+// current pairing QR PNG bytes (populated only while pairing is required),
+// and the most recent WhatsApp Web client version string applied to the store.
 type State struct {
 	mu           sync.RWMutex
 	connected    bool
 	loggedIn     bool
 	pairingQRPNG []byte
+	waVersion    string
 }
 
 func New() *State {
@@ -71,4 +73,16 @@ func (s *State) ClearPairingQR() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pairingQRPNG = nil
+}
+
+func (s *State) WAVersion() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.waVersion
+}
+
+func (s *State) SetWAVersion(v string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.waVersion = v
 }

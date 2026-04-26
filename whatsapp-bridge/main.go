@@ -1222,10 +1222,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		respondJSON(w, http.StatusOK, map[string]bool{
+		respondJSON(w, http.StatusOK, map[string]any{
 			"connected":        state.Connected(),
 			"logged_in":        state.LoggedIn(),
 			"pairing_required": state.PairingRequired(),
+			"wa_version":       state.WAVersion(),
 		})
 	})
 
@@ -2445,11 +2446,14 @@ func main() {
 		}
 	}
 
+	state := wastate.New()
+
 	version, err := CustomGetLatestVersion(context.Background(), nil)
 	if err != nil {
 		logger.Errorf("Failed to retrieve current WhatsApp Web client Version")
 	} else {
 		store.SetWAVersion(*version)
+		state.SetWAVersion(fmt.Sprintf("%d.%d.%d", version[0], version[1], version[2]))
 		logger.Infof("WhatsApp Web Client Version: %d.%d.%d\n", version[0], version[1], version[2])
 	}
 	client := whatsmeow.NewClient(deviceStore, logger)
@@ -2468,7 +2472,6 @@ func main() {
 	}
 	defer messageStore.Close()
 
-	state := wastate.New()
 	state.SetLoggedIn(client.Store.ID != nil) // existing session means already logged in
 
 	client.AddEventHandler(func(evt interface{}) {
