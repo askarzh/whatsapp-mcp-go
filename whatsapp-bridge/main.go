@@ -1225,7 +1225,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 
 	go func() {
 		if err := http.ListenAndServe(serverAddr, nil); err != nil {
-			slog.Error("REST API server error", "err", err)
+			slog.Error("rest api server error", "err", err)
 		}
 	}()
 }
@@ -1443,12 +1443,12 @@ func requestHistorySync(client *whatsmeow.Client) {
 	}
 
 	if !client.IsConnected() {
-		slog.Error("client is not connected to WhatsApp")
+		slog.Warn("client is not connected to whatsapp")
 		return
 	}
 
 	if client.Store.ID == nil {
-		slog.Error("client is not logged in, please scan the QR code")
+		slog.Warn("client is not logged in, please scan the qr code")
 		return
 	}
 
@@ -1530,7 +1530,7 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 	}
 
 	if !foundOpusHead {
-		slog.Warn("OpusHead not found, using default values")
+		slog.Warn("opushead not found, using default values")
 	}
 
 	if lastGranule > 0 {
@@ -1551,7 +1551,7 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 
 	waveform = placeholderWaveform(duration)
 
-	slog.Info("Ogg Opus analysis complete", "size_bytes", len(data), "duration_sec", duration, "waveform_bytes", len(waveform))
+	slog.Info("ogg opus analysis complete", "size_bytes", len(data), "duration_sec", duration, "waveform_bytes", len(waveform))
 
 	return duration, waveform, nil
 }
