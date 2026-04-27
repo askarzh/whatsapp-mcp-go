@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"whatsapp-bridge/auth"
@@ -1222,10 +1223,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		respondJSON(w, http.StatusOK, map[string]bool{
+		respondJSON(w, http.StatusOK, map[string]any{
 			"connected":        state.Connected(),
 			"logged_in":        state.LoggedIn(),
 			"pairing_required": state.PairingRequired(),
+			"wa_version":       state.WAVersion(),
 		})
 	})
 
@@ -2445,11 +2447,14 @@ func main() {
 		}
 	}
 
+	state := wastate.New()
+
 	version, err := CustomGetLatestVersion(context.Background(), nil)
 	if err != nil {
 		logger.Errorf("Failed to retrieve current WhatsApp Web client Version")
 	} else {
 		store.SetWAVersion(*version)
+		state.SetWAVersion(fmt.Sprintf("%d.%d.%d", version[0], version[1], version[2]))
 		logger.Infof("WhatsApp Web Client Version: %d.%d.%d\n", version[0], version[1], version[2])
 	}
 	client := whatsmeow.NewClient(deviceStore, logger)
@@ -2468,8 +2473,11 @@ func main() {
 	}
 	defer messageStore.Close()
 
-	state := wastate.New()
 	state.SetLoggedIn(client.Store.ID != nil) // existing session means already logged in
+
+	const maxOutdatedRetries = 3
+	var outdatedRetries int
+	var outdatedRetriesMu sync.Mutex
 
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -2484,6 +2492,9 @@ func main() {
 			state.SetConnected(true)
 			state.SetLoggedIn(true)
 			state.ClearPairingQR()
+			outdatedRetriesMu.Lock()
+			outdatedRetries = 0
+			outdatedRetriesMu.Unlock()
 
 		case *events.Disconnected:
 			logger.Warnf("Disconnected from WhatsApp")
@@ -2493,12 +2504,61 @@ func main() {
 			logger.Warnf("Device logged out, please scan QR code to log in again")
 			state.SetLoggedIn(false)
 			state.SetConnected(false)
+
+		case *events.ClientOutdated:
+			outdatedRetriesMu.Lock()
+			outdatedRetries++
+			n := outdatedRetries
+			outdatedRetriesMu.Unlock()
+			state.SetConnected(false)
+			if n > maxOutdatedRetries {
+				slog.Error("client outdated: exceeded retry budget; whatsmeow library likely needs a real upgrade",
+					"retries", n, "max", maxOutdatedRetries)
+				return
+			}
+			slog.Warn("client outdated (405); refreshing wa version and reconnecting",
+				"attempt", n, "max", maxOutdatedRetries)
+			go func() {
+				time.Sleep(5 * time.Second)
+				newVersion, err := CustomGetLatestVersion(context.Background(), nil)
+				if err != nil {
+					slog.Error("failed to refresh wa version", "err", err)
+					return
+				}
+				store.SetWAVersion(*newVersion)
+				state.SetWAVersion(fmt.Sprintf("%d.%d.%d", newVersion[0], newVersion[1], newVersion[2]))
+				slog.Info("applied refreshed wa version, attempting reconnect", "version", state.WAVersion())
+				if err := client.Connect(); err != nil {
+					slog.Error("reconnect after wa version refresh failed", "err", err)
+				}
+			}()
 		}
 	})
 
 	// REST server comes up first so /api/auth/status and /api/auth/pairing-qr
 	// are reachable during pairing. WhatsApp connect runs concurrently below.
 	startRESTServer(client, messageStore, cfg, state)
+
+	// Periodically refresh the WhatsApp Web client version so reconnects
+	// after transient drops use a current version string. Only the next
+	// connection picks up the refreshed value; the active session is unaffected.
+	go func() {
+		t := time.NewTicker(6 * time.Hour)
+		defer t.Stop()
+		for range t.C {
+			v, err := CustomGetLatestVersion(context.Background(), nil)
+			if err != nil {
+				slog.Warn("periodic wa version refresh failed", "err", err)
+				continue
+			}
+			store.SetWAVersion(*v)
+			next := fmt.Sprintf("%d.%d.%d", v[0], v[1], v[2])
+			if next != state.WAVersion() {
+				slog.Info("wa version updated by periodic refresh", "from", state.WAVersion(), "to", next)
+				state.SetWAVersion(next)
+			}
+		}
+	}()
 
 	// Pair / connect to WhatsApp in a goroutine so main can block on signals.
 	go func() {
