@@ -2054,7 +2054,7 @@ func (store *MessageStore) ListChats(
 	q += " LIMIT " + placeholder(len(args)+1)
 	args = append(args, limit)
 
-	q += " OFFSET " + placeholder(len(args)+2)
+	q += " OFFSET " + placeholder(len(args)+1)
 	args = append(args, page*limit)
 
 	rows, err := store.db.Query(q, args...)
