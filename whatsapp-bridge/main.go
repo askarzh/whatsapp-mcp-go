@@ -1218,6 +1218,63 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		})
 	})
 
+	// GET /api/groups/{jid} returns whatsmeow's GroupInfo for the given group
+	// JID, including the full participant roster. Use this when message-derived
+	// senders aren't enough (silent members, fresh groups). Returns 400 if the
+	// JID is malformed or not a group, 502 if whatsmeow can't reach the server.
+	apiMux.HandleFunc("/groups/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		chatJID := strings.TrimPrefix(r.URL.Path, "/groups/")
+		if chatJID == "" {
+			http.Error(w, "Missing group JID", http.StatusBadRequest)
+			return
+		}
+
+		jid, err := types.ParseJID(chatJID)
+		if err != nil {
+			http.Error(w, "Invalid JID: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if jid.Server != types.GroupServer {
+			http.Error(w, "JID is not a group", http.StatusBadRequest)
+			return
+		}
+
+		info, err := client.GetGroupInfo(r.Context(), jid)
+		if err != nil {
+			respondError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+
+		participants := make([]map[string]any, 0, len(info.Participants))
+		for _, p := range info.Participants {
+			participants = append(participants, map[string]any{
+				"jid":            p.JID.String(),
+				"phone_number":   p.PhoneNumber.String(),
+				"lid":            p.LID.String(),
+				"is_admin":       p.IsAdmin,
+				"is_super_admin": p.IsSuperAdmin,
+				"display_name":   p.DisplayName,
+			})
+		}
+
+		respondJSON(w, http.StatusOK, map[string]any{
+			"jid":               info.JID.String(),
+			"name":              info.Name,
+			"topic":             info.Topic,
+			"owner_jid":         info.OwnerJID.String(),
+			"owner_pn":          info.OwnerPN.String(),
+			"created":           info.GroupCreated,
+			"addressing_mode":   info.AddressingMode,
+			"participant_count": info.ParticipantCount,
+			"participants":      participants,
+		})
+	})
+
 	apiMux.HandleFunc("/auth/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
