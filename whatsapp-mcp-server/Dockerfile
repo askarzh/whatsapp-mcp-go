@@ -16,7 +16,7 @@ RUN go mod download
 COPY . .
 
 # Build
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GO111MODULE=on go build -a -o whatsapp-mcp-server main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GO111MODULE=on go build -a -o whatsapp-mcp-server .
 
 # Distroless minimal base image
 FROM gcr.io/distroless/static-debian12:nonroot
