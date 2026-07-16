@@ -8,6 +8,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # match the Dockerfiles: the shipped binaries are pure Go
+      CGO_ENABLED: "0"
     strategy:
       matrix:
         module: [whatsapp-bridge, whatsapp-mcp-server]

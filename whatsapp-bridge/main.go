@@ -31,7 +31,8 @@ import (
 	"go.mau.fi/whatsmeow/socket"
 
 	_ "github.com/lib/pq"
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/ncruces/go-sqlite3/driver"
+	_ "github.com/ncruces/go-sqlite3/embed"
 	"github.com/mdp/qrterminal"
 	qrcode "github.com/skip2/go-qrcode"
 
@@ -121,9 +122,11 @@ func openDatabase(dbName string) (*sql.DB, error) {
 		return sql.Open("postgres", cfg.DB.ConnString(dbName))
 	}
 
-	// Fallback to SQLite
+	// Fallback to SQLite. _time_format=sqlite keeps timestamps in the same
+	// text format the previous cgo driver (mattn/go-sqlite3) wrote, so
+	// existing databases stay readable.
 	log.Println("Connecting to sqlite3")
-	return sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	return sql.Open("sqlite3", "file:store/messages.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(10000)&_time_format=sqlite")
 }
 
 // NewMessageStore Initialize message store
@@ -2578,7 +2581,7 @@ func main() {
 	}
 
 	dialect := "sqlite3"
-	connStr := "file:store/whatsapp.db?_foreign_keys=on"
+	connStr := "file:store/whatsapp.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(10000)"
 
 	if cfg.DB.IsPostgres {
 		dialect = "postgres"
