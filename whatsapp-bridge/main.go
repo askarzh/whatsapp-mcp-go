@@ -139,6 +139,16 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
 
+	if err := createTables(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	return &MessageStore{db: db}, nil
+}
+
+// createTables creates the bridge's chat/message schema if it doesn't exist.
+func createTables(db *sql.DB) error {
 	val, ok := os.LookupEnv("IS_POSTGRES")
 
 	var blobType string
@@ -148,7 +158,7 @@ func NewMessageStore() (*MessageStore, error) {
 		blobType = "BLOB"
 	}
 
-	_, err = db.Exec(fmt.Sprintf(`
+	_, err := db.Exec(fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
@@ -174,11 +184,10 @@ func NewMessageStore() (*MessageStore, error) {
 		);
 	`, blobType, blobType, blobType))
 	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to create tables: %v", err)
+		return fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	return &MessageStore{db: db}, nil
+	return nil
 }
 
 // Close the database connection
@@ -608,10 +617,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 		defer resp.Body.Close()
 	}()
-	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	// Prefer phone-number JIDs over hidden @lid identifiers so chats and
+	// senders are keyed consistently regardless of the addressing mode.
+	ctx := context.Background()
+	chat := resolvePNJID(ctx, client.Store.LIDs, msg.Info.Chat)
+	chatJID := chat.String()
+	sender := resolveSenderPN(ctx, client.Store.LIDs, msg.Info).User
 
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, chat, chatJID, nil, sender, logger)
 
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
 	if err != nil {
@@ -1333,8 +1346,12 @@ func respondError(w http.ResponseWriter, status int, msg string) {
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
+	nameQuery := "SELECT name FROM chats WHERE jid = ?"
+	if isPostgres {
+		nameQuery = "SELECT name FROM chats WHERE jid = $1"
+	}
 	var existingName string
-	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
+	err := messageStore.db.QueryRow(nameQuery, chatJID).Scan(&existingName)
 	if err == nil && existingName != "" {
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
@@ -1385,6 +1402,8 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
+		} else if err == nil && contact.PushName != "" {
+			name = contact.PushName
 		} else if sender != "" {
 			name = sender
 		} else {
@@ -1414,6 +1433,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
 			continue
 		}
+		// Key lid-addressed chats by their phone-number JID when the mapping
+		// is known, matching the live-message path.
+		jid = resolvePNJID(context.Background(), client.Store.LIDs, jid)
+		chatJID = jid.String()
 
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
 
@@ -1469,6 +1492,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					}
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
 						sender = *msg.Message.Key.Participant
+						// Participants can be @lid; store the phone-number
+						// user part when the mapping is known.
+						if pJID, err := types.ParseJID(sender); err == nil {
+							sender = resolvePNJID(context.Background(), client.Store.LIDs, pJID).User
+						}
 					} else if isFromMe {
 						sender = client.Store.ID.User
 					} else {
@@ -2168,17 +2196,27 @@ func (store *MessageStore) SearchContacts(query string) ([]Contact, error) {
 		return "?"
 	}
 
+	// @lid contact rows carry a hidden identifier instead of a phone number;
+	// join whatsmeow's lid↔pn map so PhoneNumber is the real number whenever
+	// the mapping is known.
 	q := `
-        SELECT DISTINCT their_jid, first_name
-        FROM whatsmeow_contacts
-        WHERE (LOWER(first_name) LIKE LOWER(` + placeholder(1) + `)
-           OR LOWER(their_jid) LIKE LOWER(` + placeholder(2) + `))
-          AND their_jid NOT LIKE '%@g.us'
-        ORDER BY first_name, their_jid
+        SELECT DISTINCT c.their_jid,
+               COALESCE(NULLIF(c.full_name, ''), NULLIF(c.first_name, ''), NULLIF(c.push_name, ''), '') AS display_name,
+               COALESCE(l.pn, '') AS mapped_pn
+        FROM whatsmeow_contacts c
+        LEFT JOIN whatsmeow_lid_map l ON c.their_jid = l.lid || '@lid'
+        WHERE (LOWER(c.first_name) LIKE LOWER(` + placeholder(1) + `)
+           OR LOWER(c.full_name) LIKE LOWER(` + placeholder(2) + `)
+           OR LOWER(c.push_name) LIKE LOWER(` + placeholder(3) + `)
+           OR LOWER(c.their_jid) LIKE LOWER(` + placeholder(4) + `)
+           OR l.pn LIKE ` + placeholder(5) + `)
+          AND c.their_jid NOT LIKE '%@g.us'
+        ORDER BY display_name, c.their_jid
         LIMIT 50
     `
 
-	args := []any{"%" + query + "%", "%" + query + "%"}
+	like := "%" + query + "%"
+	args := []any{like, like, like, like, like}
 
 	rows, err := store.db.Query(q, args...)
 	if err != nil {
@@ -2187,27 +2225,43 @@ func (store *MessageStore) SearchContacts(query string) ([]Contact, error) {
 	defer rows.Close()
 
 	var contacts []Contact
+	byPhone := make(map[string]int)
 
 	for rows.Next() {
-		var jid, name sql.NullString
+		var jid, name, mappedPN sql.NullString
 
-		if err := rows.Scan(&jid, &name); err != nil {
+		if err := rows.Scan(&jid, &name, &mappedPN); err != nil {
 			continue
 		}
 		if !jid.Valid {
 			continue
 		}
 
-		phone := strings.Split(jid.String, "@")[0]
+		phone := mappedPN.String
+		if phone == "" {
+			phone = strings.Split(jid.String, "@")[0]
+		}
 
 		c := Contact{
 			PhoneNumber: phone,
 			JID:         jid.String,
-		}
-		if name.Valid {
-			c.Name = name.String
+			Name:        name.String,
 		}
 
+		// The same person can be synced under both a @lid and a phone-number
+		// JID; collapse them into one entry, preferring the pn-form JID and
+		// whichever row has a name.
+		if idx, seen := byPhone[phone]; seen {
+			if contacts[idx].Name == "" {
+				contacts[idx].Name = c.Name
+			}
+			if strings.HasSuffix(c.JID, "@s.whatsapp.net") {
+				contacts[idx].JID = c.JID
+			}
+			continue
+		}
+
+		byPhone[phone] = len(contacts)
 		contacts = append(contacts, c)
 	}
 
@@ -2535,6 +2589,7 @@ func main() {
 	const maxOutdatedRetries = 3
 	var outdatedRetries int
 	var outdatedRetriesMu sync.Mutex
+	var lidMigration sync.Once
 
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -2552,6 +2607,12 @@ func main() {
 			outdatedRetriesMu.Lock()
 			outdatedRetries = 0
 			outdatedRetriesMu.Unlock()
+			// Backfill @lid-keyed chats/senders accumulated before LID
+			// support; runs once per process, after the session is up so
+			// whatsmeow's lid↔pn map is populated.
+			go lidMigration.Do(func() {
+				migrateLIDData(context.Background(), client, messageStore)
+			})
 
 		case *events.Disconnected:
 			logger.Warnf("Disconnected from WhatsApp")
