@@ -1200,7 +1200,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		path := strings.TrimPrefix(r.URL.Path, "/contacts/")
 		parts := strings.Split(path, "/")
 		if len(parts) < 2 || parts[1] != "chats" {
-			// Skip if not this endpoint (previous handler already took /chat)
+			http.Error(w, "Not found. Use /api/contacts/{jid}/chats", http.StatusNotFound)
 			return
 		}
 
@@ -2083,6 +2083,22 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 	}, nil
 }
 
+// lastMessageJoin joins each chat to its single most recent message. Joining
+// on last_message_time instead would duplicate chats when messages tie on
+// timestamp and miss the message entirely when the chat row's time drifts.
+const lastMessageJoin = `
+        LEFT JOIN (
+            SELECT chat_jid, content, sender, is_from_me,
+                   ROW_NUMBER() OVER (PARTITION BY chat_jid ORDER BY timestamp DESC, id DESC) AS rn
+            FROM messages
+        ) m ON m.chat_jid = c.jid AND m.rn = 1
+    `
+
+const lastMessageColumns = `,
+            m.content AS last_message,
+            m.sender AS last_sender,
+            m.is_from_me AS last_is_from_me`
+
 func (store *MessageStore) ListChats(
 	query *string,
 	limit, page int,
@@ -2098,20 +2114,17 @@ func (store *MessageStore) ListChats(
 	}
 
 	q := `
-        SELECT 
-            c.jid, c.name, c.last_message_time,
-            m.content AS last_message,
-            m.sender AS last_sender,
-            m.is_from_me AS last_is_from_me
+        SELECT
+            c.jid, c.name, c.last_message_time`
+	if includeLastMessage {
+		q += lastMessageColumns
+	}
+	q += `
         FROM chats c
     `
 
 	if includeLastMessage {
-		q += `
-            LEFT JOIN messages m 
-            ON c.jid = m.chat_jid 
-            AND c.last_message_time = m.timestamp
-        `
+		q += lastMessageJoin
 	}
 
 	var args []any
@@ -2159,8 +2172,14 @@ func (store *MessageStore) ListChats(
 			lastFromMe  sql.NullBool
 		)
 
-		if err := rows.Scan(&jid, &name, &lastMsgTime, &lastMsg, &lastSender, &lastFromMe); err != nil {
-			log.Printf("list_chats scan error: %v", err)
+		var scanErr error
+		if includeLastMessage {
+			scanErr = rows.Scan(&jid, &name, &lastMsgTime, &lastMsg, &lastSender, &lastFromMe)
+		} else {
+			scanErr = rows.Scan(&jid, &name, &lastMsgTime)
+		}
+		if scanErr != nil {
+			log.Printf("list_chats scan error: %v", scanErr)
 			continue
 		}
 
@@ -2406,20 +2425,17 @@ func (store *MessageStore) GetChat(chatJID string, includeLastMessage bool) (*Ch
 	}
 
 	q := `
-        SELECT 
-            c.jid, c.name, c.last_message_time,
-            m.content AS last_message,
-            m.sender AS last_sender,
-            m.is_from_me AS last_is_from_me
+        SELECT
+            c.jid, c.name, c.last_message_time`
+	if includeLastMessage {
+		q += lastMessageColumns
+	}
+	q += `
         FROM chats c
     `
 
 	if includeLastMessage {
-		q += `
-            LEFT JOIN messages m 
-            ON c.jid = m.chat_jid 
-            AND c.last_message_time = m.timestamp
-        `
+		q += lastMessageJoin
 	}
 
 	q += " WHERE c.jid = " + placeholder(1)
@@ -2435,11 +2451,17 @@ func (store *MessageStore) GetChat(chatJID string, includeLastMessage bool) (*Ch
 		lfromme sql.NullBool
 	)
 
-	if err := row.Scan(&jid, &name, &lmt, &lmsg, &lsender, &lfromme); err != nil {
-		if err == sql.ErrNoRows {
+	var scanErr error
+	if includeLastMessage {
+		scanErr = row.Scan(&jid, &name, &lmt, &lmsg, &lsender, &lfromme)
+	} else {
+		scanErr = row.Scan(&jid, &name, &lmt)
+	}
+	if scanErr != nil {
+		if scanErr == sql.ErrNoRows {
 			return nil, nil
 		}
-		return nil, err
+		return nil, scanErr
 	}
 
 	c := Chat{JID: jid}
@@ -2472,15 +2494,10 @@ func (store *MessageStore) GetDirectChatByContact(phone string) (*Chat, error) {
 	}
 
 	q := `
-       SELECT 
-           c.jid, c.name, c.last_message_time,
-           m.content AS last_message,
-           m.sender AS last_sender,
-           m.is_from_me AS last_is_from_me
+       SELECT
+           c.jid, c.name, c.last_message_time` + lastMessageColumns + `
        FROM chats c
-       LEFT JOIN messages m 
-           ON c.jid = m.chat_jid 
-          AND c.last_message_time = m.timestamp
+       ` + lastMessageJoin + `
        WHERE c.jid LIKE ` + placeholder(1) + `
          AND c.jid NOT LIKE '%@g.us'
        LIMIT 1
@@ -2500,6 +2517,9 @@ func (store *MessageStore) GetDirectChatByContact(phone string) (*Chat, error) {
 	)
 
 	if err := row.Scan(&jid, &name, &lmt, &lmsg, &lsender, &lfromme); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
 		return nil, err
 	}
 
