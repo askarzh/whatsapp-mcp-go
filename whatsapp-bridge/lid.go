@@ -53,13 +53,6 @@ func applyLIDMappings(ms *MessageStore, mappings []store.LIDMapping, nameFor fun
 }
 
 func applyOneLIDMapping(ms *MessageStore, m store.LIDMapping, nameFor func(pn types.JID) string) error {
-	placeholder := func(n int) string {
-		if isPostgres {
-			return fmt.Sprintf("$%d", n)
-		}
-		return "?"
-	}
-
 	lidJID := types.NewJID(m.LID.User, types.HiddenUserServer).String()
 	pnJID := types.NewJID(m.PN.User, types.DefaultUserServer).String()
 
