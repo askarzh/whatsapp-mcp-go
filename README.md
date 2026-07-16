@@ -161,6 +161,20 @@ Override with `AUTH_LOGIN_RATE=<count>/<window>` (e.g. `10/30s`). Behind a
 reverse proxy, terminate rate limiting upstream — the bridge currently uses
 `r.RemoteAddr` and does not consult `X-Forwarded-For`.
 
+### Media path restrictions
+
+`POST /api/send` reads `media_path` from the **bridge's** filesystem. To keep
+the API from being usable for reading arbitrary host files, paths are only
+accepted inside the bridge's `store/` directory or the OS temp directory by
+default. Override the allowlist with `MEDIA_ALLOWED_DIRS` (colon-separated),
+e.g. `MEDIA_ALLOWED_DIRS=/data/media:/shared`.
+
+### Postgres TLS
+
+The bridge connects with `sslmode=disable` by default (matching the bundled
+docker-compose network). Set `POSTGRES_SSLMODE` (e.g. `require`,
+`verify-full`) when the database is reached over an untrusted network.
+
 ## Architecture Overview
 
 This application consists of two main components:
