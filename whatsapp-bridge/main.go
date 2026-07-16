@@ -570,7 +570,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	chatJID := chat.String()
 	sender := resolveSenderPN(ctx, client.Store.LIDs, msg.Info).User
 
-	name := GetChatName(client, messageStore, chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, chat, chatJID, nil,
+		nameHintForChat(msg.Info.IsFromMe, sender), logger)
 
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
 	if err != nil {
@@ -2490,7 +2491,34 @@ func main() {
 			// support; runs once per process, after the session is up so
 			// whatsmeow's lid↔pn map is populated.
 			go lidMigration.Do(func() {
-				migrateLIDData(context.Background(), client, messageStore)
+				ctx := context.Background()
+				migrateLIDData(ctx, client, messageStore)
+
+				// Repair chats named after the account owner (old bug:
+				// outgoing messages used the sender as name fallback).
+				var selfUsers []string
+				if client.Store.ID != nil {
+					selfUsers = append(selfUsers, client.Store.ID.User)
+				}
+				if !client.Store.LID.IsEmpty() {
+					selfUsers = append(selfUsers, client.Store.LID.User)
+				}
+				nameFor := func(jid types.JID) string {
+					pn := resolvePNJID(ctx, client.Store.LIDs, jid)
+					contact, err := client.Store.Contacts.GetContact(ctx, pn)
+					if err != nil {
+						return ""
+					}
+					if contact.FullName != "" {
+						return contact.FullName
+					}
+					return contact.PushName
+				}
+				if n, err := repairSelfNamedChats(messageStore, selfUsers, nameFor); err != nil {
+					slog.Error("self-named chat repair failed", "err", err)
+				} else if n > 0 {
+					slog.Info("renamed chats that carried the owner's own id", "count", n)
+				}
 			})
 
 		case *events.Disconnected:
