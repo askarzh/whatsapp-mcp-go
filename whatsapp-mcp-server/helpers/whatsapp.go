@@ -11,8 +11,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
 type Message struct {

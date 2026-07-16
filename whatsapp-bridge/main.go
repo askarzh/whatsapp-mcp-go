@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -28,11 +27,13 @@ import (
 	"whatsapp-bridge/wastate"
 
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/socket"
 
 	_ "github.com/lib/pq"
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
+	_ "github.com/ncruces/go-sqlite3/driver"
+	_ "github.com/ncruces/go-sqlite3/embed"
 	qrcode "github.com/skip2/go-qrcode"
 
 	"bytes"
@@ -109,6 +110,14 @@ type MessageStore struct {
 
 var isPostgres = false
 
+// placeholder returns the SQL positional placeholder for the active dialect.
+func placeholder(n int) string {
+	if isPostgres {
+		return fmt.Sprintf("$%d", n)
+	}
+	return "?"
+}
+
 func openDatabase(dbName string) (*sql.DB, error) {
 	if val, ok := os.LookupEnv("IS_POSTGRES"); ok && strings.ToLower(val) == "true" {
 		cfg, err := config.LoadConfig()
@@ -117,15 +126,15 @@ func openDatabase(dbName string) (*sql.DB, error) {
 		}
 		isPostgres = cfg.DB.IsPostgres
 
-		connStr := fmt.Sprintf("postgresql://%s:%s@%s:%s/%s?sslmode=disable",
-			cfg.DB.User, cfg.DB.Pass, cfg.DB.Host, cfg.DB.Port, dbName)
 		log.Println("Connecting to postgres")
-		return sql.Open("postgres", connStr)
+		return sql.Open("postgres", cfg.DB.ConnString(dbName))
 	}
 
-	// Fallback to SQLite
+	// Fallback to SQLite. _time_format=sqlite keeps timestamps in the same
+	// text format the previous cgo driver (mattn/go-sqlite3) wrote, so
+	// existing databases stay readable.
 	log.Println("Connecting to sqlite3")
-	return sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	return sql.Open("sqlite3", "file:store/messages.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(10000)&_time_format=sqlite")
 }
 
 // NewMessageStore Initialize message store
@@ -252,69 +261,6 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	)
 
 	return err
-}
-
-// GetMessages Get messages from a chat
-func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
-	var rows *sql.Rows
-	var err error
-
-	if isPostgres {
-		rows, err = store.db.Query(
-			`SELECT sender, content, timestamp, is_from_me, media_type, filename 
-					 FROM messages 
-					 WHERE chat_jid = $1 
-					 ORDER BY timestamp DESC 
-					 LIMIT $2`,
-			chatJID, limit,
-		)
-	} else {
-		rows, err = store.db.Query(
-			"SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
-			chatJID, limit,
-		)
-	}
-
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var messages []Message
-	for rows.Next() {
-		var msg Message
-		var timestamp time.Time
-		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename)
-		if err != nil {
-			return nil, err
-		}
-		msg.Time = timestamp
-		messages = append(messages, msg)
-	}
-
-	return messages, nil
-}
-
-// GetChats Get all chats
-func (store *MessageStore) GetChats() (map[string]time.Time, error) {
-	rows, err := store.db.Query("SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	chats := make(map[string]time.Time)
-	for rows.Next() {
-		var jid string
-		var lastMessageTime time.Time
-		err := rows.Scan(&jid, &lastMessageTime)
-		if err != nil {
-			return nil, err
-		}
-		chats[jid] = lastMessageTime
-	}
-
-	return chats, nil
 }
 
 // Extract text content from a message
@@ -786,7 +732,12 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var fileLength uint64
 	var err error
 
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	// chatJID comes from the request and filename from the sender of the
+	// message; both must be confined to the store directory.
+	chatDir, err := safeChildPath("store", chatJID)
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("invalid chat JID: %v", err)
+	}
 	localPath := ""
 
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err = messageStore.GetMediaInfo(messageID, chatJID)
@@ -817,7 +768,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	localPath, err = safeChildPath(chatDir, filename)
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("invalid media filename: %v", err)
+	}
 
 	absPath, err := filepath.Abs(localPath)
 	if err != nil {
@@ -914,6 +868,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		if req.Message == "" && req.MediaPath == "" {
 			http.Error(w, "Message or media path is required", http.StatusBadRequest)
 			return
+		}
+
+		// The bridge reads the media file from its own filesystem; only
+		// allow paths inside the configured media directories so the API
+		// can't be used to exfiltrate arbitrary host files.
+		if req.MediaPath != "" {
+			if err := allowedMediaPath(cfg.MediaDirs, req.MediaPath); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 		}
 
 		slog.Info("received request to send message", "message", req.Message, "media_path", req.MediaPath)
@@ -1200,7 +1164,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		path := strings.TrimPrefix(r.URL.Path, "/contacts/")
 		parts := strings.Split(path, "/")
 		if len(parts) < 2 || parts[1] != "chats" {
-			// Skip if not this endpoint (previous handler already took /chat)
+			http.Error(w, "Not found. Use /api/contacts/{jid}/chats", http.StatusNotFound)
 			return
 		}
 
@@ -1325,8 +1289,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 	serverAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	slog.Info("starting REST API server", "addr", serverAddr)
 
+	srv := &http.Server{
+		Addr:              serverAddr,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		// Generous: /download responses wait on WhatsApp media servers.
+		WriteTimeout: 5 * time.Minute,
+		IdleTimeout:  2 * time.Minute,
+	}
+
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := srv.ListenAndServe(); err != nil {
 			slog.Error("rest api server error", "err", err)
 		}
 	}()
@@ -1345,13 +1318,9 @@ func respondError(w http.ResponseWriter, status int, msg string) {
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
-func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
-	nameQuery := "SELECT name FROM chats WHERE jid = ?"
-	if isPostgres {
-		nameQuery = "SELECT name FROM chats WHERE jid = $1"
-	}
+func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation *waHistorySync.Conversation, sender string, logger waLog.Logger) string {
 	var existingName string
-	err := messageStore.db.QueryRow(nameQuery, chatJID).Scan(&existingName)
+	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = "+placeholder(1), chatJID).Scan(&existingName)
 	if err == nil && existingName != "" {
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
@@ -1362,28 +1331,10 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	if jid.Server == "g.us" {
 		logger.Infof("Getting name for group: %s", chatJID)
 
-		if conversation != nil {
-			var displayName, convName *string
-			v := reflect.ValueOf(conversation)
-			if v.Kind() == reflect.Ptr && !v.IsNil() {
-				v = v.Elem()
-
-				if displayNameField := v.FieldByName("DisplayName"); displayNameField.IsValid() && displayNameField.Kind() == reflect.Ptr && !displayNameField.IsNil() {
-					dn := displayNameField.Elem().String()
-					displayName = &dn
-				}
-
-				if nameField := v.FieldByName("Name"); nameField.IsValid() && nameField.Kind() == reflect.Ptr && !nameField.IsNil() {
-					n := nameField.Elem().String()
-					convName = &n
-				}
-			}
-
-			if displayName != nil && *displayName != "" {
-				name = *displayName
-			} else if convName != nil && *convName != "" {
-				name = *convName
-			}
+		if dn := conversation.GetDisplayName(); dn != "" {
+			name = dn
+		} else if cn := conversation.GetName(); cn != "" {
+			name = cn
 		}
 
 		if name == "" {
@@ -1550,41 +1501,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	}
 
 	slog.Info("history sync complete", "stored_messages", syncedCount)
-}
-
-// Request history sync from the server
-func requestHistorySync(client *whatsmeow.Client) {
-	if client == nil {
-		slog.Error("client is not initialized, cannot request history sync")
-		return
-	}
-
-	if !client.IsConnected() {
-		slog.Warn("client is not connected to whatsapp")
-		return
-	}
-
-	if client.Store.ID == nil {
-		slog.Warn("client is not logged in, please scan the qr code")
-		return
-	}
-
-	historyMsg := client.BuildHistorySyncRequest(nil, 100)
-	if historyMsg == nil {
-		slog.Error("failed to build history sync request")
-		return
-	}
-
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
-
-	if err != nil {
-		slog.Error("failed to request history sync", "err", err)
-	} else {
-		slog.Info("history sync requested, waiting for server response")
-	}
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file
@@ -1805,13 +1721,6 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
 	var args []any
 	var where []string
 
-	placeholder := func(n int) string {
-		if isPostgres {
-			return fmt.Sprintf("$%d", n)
-		}
-		return "?"
-	}
-
 	q := `
         SELECT 
             m.timestamp, m.sender, c.name, m.content, m.is_from_me, 
@@ -1926,13 +1835,6 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
 }
 
 func (store *MessageStore) GetMessageContext(messageID string, before, after int) (MessageContext, error) {
-	placeholder := func(n int) string {
-		if isPostgres {
-			return fmt.Sprintf("$%d", n)
-		}
-		return "?"
-	}
-
 	// --- Fetch the target message ---
 	q := `
         SELECT m.timestamp, m.sender, c.name, m.content, m.is_from_me,
@@ -2083,6 +1985,22 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 	}, nil
 }
 
+// lastMessageJoin joins each chat to its single most recent message. Joining
+// on last_message_time instead would duplicate chats when messages tie on
+// timestamp and miss the message entirely when the chat row's time drifts.
+const lastMessageJoin = `
+        LEFT JOIN (
+            SELECT chat_jid, content, sender, is_from_me,
+                   ROW_NUMBER() OVER (PARTITION BY chat_jid ORDER BY timestamp DESC, id DESC) AS rn
+            FROM messages
+        ) m ON m.chat_jid = c.jid AND m.rn = 1
+    `
+
+const lastMessageColumns = `,
+            m.content AS last_message,
+            m.sender AS last_sender,
+            m.is_from_me AS last_is_from_me`
+
 func (store *MessageStore) ListChats(
 	query *string,
 	limit, page int,
@@ -2090,28 +2008,18 @@ func (store *MessageStore) ListChats(
 	sortBy string,
 ) ([]Chat, error) {
 
-	placeholder := func(n int) string {
-		if isPostgres {
-			return fmt.Sprintf("$%d", n)
-		}
-		return "?"
-	}
-
 	q := `
-        SELECT 
-            c.jid, c.name, c.last_message_time,
-            m.content AS last_message,
-            m.sender AS last_sender,
-            m.is_from_me AS last_is_from_me
+        SELECT
+            c.jid, c.name, c.last_message_time`
+	if includeLastMessage {
+		q += lastMessageColumns
+	}
+	q += `
         FROM chats c
     `
 
 	if includeLastMessage {
-		q += `
-            LEFT JOIN messages m 
-            ON c.jid = m.chat_jid 
-            AND c.last_message_time = m.timestamp
-        `
+		q += lastMessageJoin
 	}
 
 	var args []any
@@ -2159,8 +2067,14 @@ func (store *MessageStore) ListChats(
 			lastFromMe  sql.NullBool
 		)
 
-		if err := rows.Scan(&jid, &name, &lastMsgTime, &lastMsg, &lastSender, &lastFromMe); err != nil {
-			log.Printf("list_chats scan error: %v", err)
+		var scanErr error
+		if includeLastMessage {
+			scanErr = rows.Scan(&jid, &name, &lastMsgTime, &lastMsg, &lastSender, &lastFromMe)
+		} else {
+			scanErr = rows.Scan(&jid, &name, &lastMsgTime)
+		}
+		if scanErr != nil {
+			log.Printf("list_chats scan error: %v", scanErr)
 			continue
 		}
 
@@ -2189,13 +2103,6 @@ func (store *MessageStore) ListChats(
 }
 
 func (store *MessageStore) SearchContacts(query string) ([]Contact, error) {
-	placeholder := func(n int) string {
-		if isPostgres {
-			return fmt.Sprintf("$%d", n)
-		}
-		return "?"
-	}
-
 	// @lid contact rows carry a hidden identifier instead of a phone number;
 	// join whatsmeow's lid↔pn map so PhoneNumber is the real number whenever
 	// the mapping is known.
@@ -2269,13 +2176,6 @@ func (store *MessageStore) SearchContacts(query string) ([]Contact, error) {
 }
 
 func (store *MessageStore) GetContactChats(jid string, limit, page int) ([]Chat, error) {
-	placeholder := func(n int) string {
-		if isPostgres {
-			return fmt.Sprintf("$%d", n)
-		}
-		return "?"
-	}
-
 	q := `
         SELECT DISTINCT
             c.jid, c.name, c.last_message_time,
@@ -2339,13 +2239,6 @@ func (store *MessageStore) GetContactChats(jid string, limit, page int) ([]Chat,
 }
 
 func (store *MessageStore) GetLastInteraction(jid string) (string, error) {
-	placeholder := func(n int) string {
-		if isPostgres {
-			return fmt.Sprintf("$%d", n)
-		}
-		return "?"
-	}
-
 	q := `
         SELECT 
             m.timestamp, m.sender, c.name, m.content, m.is_from_me,
@@ -2398,28 +2291,18 @@ func (store *MessageStore) GetLastInteraction(jid string) (string, error) {
 }
 
 func (store *MessageStore) GetChat(chatJID string, includeLastMessage bool) (*Chat, error) {
-	placeholder := func(n int) string {
-		if isPostgres {
-			return fmt.Sprintf("$%d", n)
-		}
-		return "?"
-	}
-
 	q := `
-        SELECT 
-            c.jid, c.name, c.last_message_time,
-            m.content AS last_message,
-            m.sender AS last_sender,
-            m.is_from_me AS last_is_from_me
+        SELECT
+            c.jid, c.name, c.last_message_time`
+	if includeLastMessage {
+		q += lastMessageColumns
+	}
+	q += `
         FROM chats c
     `
 
 	if includeLastMessage {
-		q += `
-            LEFT JOIN messages m 
-            ON c.jid = m.chat_jid 
-            AND c.last_message_time = m.timestamp
-        `
+		q += lastMessageJoin
 	}
 
 	q += " WHERE c.jid = " + placeholder(1)
@@ -2435,11 +2318,17 @@ func (store *MessageStore) GetChat(chatJID string, includeLastMessage bool) (*Ch
 		lfromme sql.NullBool
 	)
 
-	if err := row.Scan(&jid, &name, &lmt, &lmsg, &lsender, &lfromme); err != nil {
-		if err == sql.ErrNoRows {
+	var scanErr error
+	if includeLastMessage {
+		scanErr = row.Scan(&jid, &name, &lmt, &lmsg, &lsender, &lfromme)
+	} else {
+		scanErr = row.Scan(&jid, &name, &lmt)
+	}
+	if scanErr != nil {
+		if scanErr == sql.ErrNoRows {
 			return nil, nil
 		}
-		return nil, err
+		return nil, scanErr
 	}
 
 	c := Chat{JID: jid}
@@ -2464,23 +2353,11 @@ func (store *MessageStore) GetChat(chatJID string, includeLastMessage bool) (*Ch
 }
 
 func (store *MessageStore) GetDirectChatByContact(phone string) (*Chat, error) {
-	placeholder := func(n int) string {
-		if isPostgres {
-			return fmt.Sprintf("$%d", n)
-		}
-		return "?"
-	}
-
 	q := `
-       SELECT 
-           c.jid, c.name, c.last_message_time,
-           m.content AS last_message,
-           m.sender AS last_sender,
-           m.is_from_me AS last_is_from_me
+       SELECT
+           c.jid, c.name, c.last_message_time` + lastMessageColumns + `
        FROM chats c
-       LEFT JOIN messages m 
-           ON c.jid = m.chat_jid 
-          AND c.last_message_time = m.timestamp
+       ` + lastMessageJoin + `
        WHERE c.jid LIKE ` + placeholder(1) + `
          AND c.jid NOT LIKE '%@g.us'
        LIMIT 1
@@ -2500,6 +2377,9 @@ func (store *MessageStore) GetDirectChatByContact(phone string) (*Chat, error) {
 	)
 
 	if err := row.Scan(&jid, &name, &lmt, &lmsg, &lsender, &lfromme); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
 		return nil, err
 	}
 
@@ -2533,12 +2413,11 @@ func main() {
 	}
 
 	dialect := "sqlite3"
-	connStr := "file:store/whatsapp.db?_foreign_keys=on"
+	connStr := "file:store/whatsapp.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(10000)"
 
 	if cfg.DB.IsPostgres {
 		dialect = "postgres"
-		connStr = fmt.Sprintf("postgresql://%s:%s@%s:%s/%s?sslmode=disable", cfg.DB.User,
-			cfg.DB.Pass, cfg.DB.Host, cfg.DB.Port, "whatsapp")
+		connStr = cfg.DB.ConnString("whatsapp")
 	}
 
 	container, err := sqlstore.New(context.Background(), dialect, connStr, dbLog)

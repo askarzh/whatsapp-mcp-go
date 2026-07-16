@@ -12,10 +12,12 @@ import (
 
 func newTestMessageStore(t *testing.T) *MessageStore {
 	t.Helper()
-	db, err := sql.Open("sqlite3", "file::memory:?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", "file::memory:?_pragma=foreign_keys(1)&_time_format=sqlite")
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
+	// each connection to :memory: is a separate database
+	db.SetMaxOpenConns(1)
 	t.Cleanup(func() { db.Close() })
 	if err := createTables(db); err != nil {
 		t.Fatalf("create tables: %v", err)
