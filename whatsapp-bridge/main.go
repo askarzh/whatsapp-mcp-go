@@ -117,10 +117,8 @@ func openDatabase(dbName string) (*sql.DB, error) {
 		}
 		isPostgres = cfg.DB.IsPostgres
 
-		connStr := fmt.Sprintf("postgresql://%s:%s@%s:%s/%s?sslmode=disable",
-			cfg.DB.User, cfg.DB.Pass, cfg.DB.Host, cfg.DB.Port, dbName)
 		log.Println("Connecting to postgres")
-		return sql.Open("postgres", connStr)
+		return sql.Open("postgres", cfg.DB.ConnString(dbName))
 	}
 
 	// Fallback to SQLite
@@ -786,7 +784,12 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var fileLength uint64
 	var err error
 
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	// chatJID comes from the request and filename from the sender of the
+	// message; both must be confined to the store directory.
+	chatDir, err := safeChildPath("store", chatJID)
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("invalid chat JID: %v", err)
+	}
 	localPath := ""
 
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err = messageStore.GetMediaInfo(messageID, chatJID)
@@ -817,7 +820,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	localPath, err = safeChildPath(chatDir, filename)
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("invalid media filename: %v", err)
+	}
 
 	absPath, err := filepath.Abs(localPath)
 	if err != nil {
@@ -914,6 +920,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		if req.Message == "" && req.MediaPath == "" {
 			http.Error(w, "Message or media path is required", http.StatusBadRequest)
 			return
+		}
+
+		// The bridge reads the media file from its own filesystem; only
+		// allow paths inside the configured media directories so the API
+		// can't be used to exfiltrate arbitrary host files.
+		if req.MediaPath != "" {
+			if err := allowedMediaPath(cfg.MediaDirs, req.MediaPath); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 		}
 
 		slog.Info("received request to send message", "message", req.Message, "media_path", req.MediaPath)
@@ -1325,8 +1341,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 	serverAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	slog.Info("starting REST API server", "addr", serverAddr)
 
+	srv := &http.Server{
+		Addr:              serverAddr,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		// Generous: /download responses wait on WhatsApp media servers.
+		WriteTimeout: 5 * time.Minute,
+		IdleTimeout:  2 * time.Minute,
+	}
+
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := srv.ListenAndServe(); err != nil {
 			slog.Error("rest api server error", "err", err)
 		}
 	}()
@@ -2557,8 +2582,7 @@ func main() {
 
 	if cfg.DB.IsPostgres {
 		dialect = "postgres"
-		connStr = fmt.Sprintf("postgresql://%s:%s@%s:%s/%s?sslmode=disable", cfg.DB.User,
-			cfg.DB.Pass, cfg.DB.Host, cfg.DB.Port, "whatsapp")
+		connStr = cfg.DB.ConnString("whatsapp")
 	}
 
 	container, err := sqlstore.New(context.Background(), dialect, connStr, dbLog)

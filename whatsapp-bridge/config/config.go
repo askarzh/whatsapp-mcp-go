@@ -3,8 +3,10 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type dbConfig struct {
@@ -13,6 +15,20 @@ type dbConfig struct {
 	Host       string
 	Port       string
 	IsPostgres bool
+	SSLMode    string
+}
+
+// ConnString returns a postgres connection URL for dbName with credentials
+// URL-escaped, so passwords containing reserved characters don't corrupt it.
+func (d dbConfig) ConnString(dbName string) string {
+	u := url.URL{
+		Scheme:   "postgresql",
+		User:     url.UserPassword(d.User, d.Pass),
+		Host:     d.Host + ":" + d.Port,
+		Path:     "/" + dbName,
+		RawQuery: "sslmode=" + url.QueryEscape(d.SSLMode),
+	}
+	return u.String()
 }
 
 type Config struct {
@@ -23,6 +39,8 @@ type Config struct {
 	Host          string
 	Port          int
 	AuthLoginRate string
+	// MediaDirs are the only directories /api/send may read media files from.
+	MediaDirs []string
 }
 
 func LoadConfig() (*Config, error) {
@@ -77,6 +95,18 @@ func LoadConfig() (*Config, error) {
 
 	authLoginRate := os.Getenv("AUTH_LOGIN_RATE") // parsed in auth package; empty -> default
 
+	sslMode := os.Getenv("POSTGRES_SSLMODE")
+	if sslMode == "" {
+		sslMode = "disable"
+	}
+
+	// Default allows the bridge's own store plus the OS temp dir (the MCP
+	// server writes converted voice notes there in same-host deployments).
+	mediaDirs := []string{"store", os.TempDir()}
+	if v := os.Getenv("MEDIA_ALLOWED_DIRS"); v != "" {
+		mediaDirs = strings.Split(v, ":")
+	}
+
 	return &Config{
 		DB: dbConfig{
 			User:       user,
@@ -84,6 +114,7 @@ func LoadConfig() (*Config, error) {
 			Host:       host,
 			Port:       port,
 			IsPostgres: isPostgres,
+			SSLMode:    sslMode,
 		},
 		JWTSecret:     []byte(jwtSecret),
 		APIKey:        apiKey,
@@ -91,6 +122,7 @@ func LoadConfig() (*Config, error) {
 		Host:          serverHost,
 		Port:          serverPort,
 		AuthLoginRate: authLoginRate,
+		MediaDirs:     mediaDirs,
 	}, nil
 }
 
