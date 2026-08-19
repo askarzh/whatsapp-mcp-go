@@ -1,6 +1,7 @@
 package config
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -77,4 +78,43 @@ func TestLoadConfigSSLModeAndMediaDirs(t *testing.T) {
 			t.Errorf("MediaDirs = %v, want [/data/media /shared]", cfg.MediaDirs)
 		}
 	})
+}
+
+// Downloaded media has to be reachable by the OTHER containers (files-mcp, the
+// MCP server); "store" is private to the bridge, so the directory is
+// configurable. It is also added to MediaDirs so a file that was downloaded can
+// be sent back out again without extra configuration.
+func TestMediaDownloadDir(t *testing.T) {
+	t.Setenv("WHATSAPP_API_KEY", "0123456789012345678901234567890123456789")
+	t.Setenv("WHATSAPP_JWT_SECRET", "0123456789012345678901234567890123456789")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MediaDownloadDir != "store" {
+		t.Errorf("default MediaDownloadDir = %q, want \"store\"", cfg.MediaDownloadDir)
+	}
+
+	t.Setenv("MEDIA_DOWNLOAD_DIR", "/shared/whatsapp")
+	cfg, err = LoadConfig()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MediaDownloadDir != "/shared/whatsapp" {
+		t.Errorf("MediaDownloadDir = %q, want /shared/whatsapp", cfg.MediaDownloadDir)
+	}
+	if !slices.Contains(cfg.MediaDirs, "/shared/whatsapp") {
+		t.Errorf("MediaDirs = %v, want it to contain the download dir", cfg.MediaDirs)
+	}
+
+	// An explicit allowlist stays authoritative — we do not widen it.
+	t.Setenv("MEDIA_ALLOWED_DIRS", "/data/media")
+	cfg, err = LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !slices.Equal(cfg.MediaDirs, []string{"/data/media"}) {
+		t.Errorf("MediaDirs = %v, want [/data/media] verbatim", cfg.MediaDirs)
+	}
 }

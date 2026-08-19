@@ -2,6 +2,7 @@ package helpers
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,7 +10,9 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -119,36 +122,44 @@ type searchContactsInput struct {
 	Query string `json:"query" mcp:"description:Search term to match against contact names or phone numbers"`
 }
 
+// NOTE ON TAGS: the go-sdk marks every field WITHOUT json ",omitempty" as
+// required, and it uses the entire `jsonschema` tag as the property description
+// — it parses no "description:"/"default:"/"enum:" prefixes. So a tag like
+// `jsonschema:"default:20"` set no default and printed "default:20" to the
+// model, while the missing ",omitempty" made limit/page/include_context/...
+// mandatory on every call. Optional fields carry ",omitempty" here and their
+// defaults are applied by the handlers below.
+
 type listMessagesInput struct {
-	After             *string `mcp:"description:ISO-8601 formatted string"`
-	Before            *string `json:"before,omitempty" jsonschema:"description:ISO-8601 formatted string"`
-	SenderPhoneNumber *string `json:"sender_phone_number,omitempty"`
-	ChatJid           *string `json:"chat_jid,omitempty"`
-	Query             *string `json:"query,omitempty" jsonschema:"description:Search term in message content"`
-	Limit             int     `json:"limit" jsonschema:"default:20"`
-	Page              int     `json:"page" jsonschema:"default:0"`
-	IncludeContext    bool    `json:"include_context" jsonschema:"default:true"`
-	ContextBefore     int     `json:"context_before" jsonschema:"default:1"`
-	ContextAfter      int     `json:"context_after" jsonschema:"default:1"`
+	After             *string `json:"after,omitempty" jsonschema:"Only messages at or after this ISO-8601 timestamp"`
+	Before            *string `json:"before,omitempty" jsonschema:"Only messages at or before this ISO-8601 timestamp"`
+	SenderPhoneNumber *string `json:"sender_phone_number,omitempty" jsonschema:"Only messages from this phone number"`
+	ChatJid           *string `json:"chat_jid,omitempty" jsonschema:"Only messages in this chat, e.g. 77001234567@s.whatsapp.net"`
+	Query             *string `json:"query,omitempty" jsonschema:"Search term in message content"`
+	Limit             int     `json:"limit,omitempty" jsonschema:"Maximum messages to return (default 20)"`
+	Page              int     `json:"page,omitempty" jsonschema:"Zero-based page of results (default 0)"`
+	IncludeContext    *bool   `json:"include_context,omitempty" jsonschema:"Include the messages surrounding each match (default true)"`
+	ContextBefore     *int    `json:"context_before,omitempty" jsonschema:"Accepted for compatibility; the bridge fixes the context window"`
+	ContextAfter      *int    `json:"context_after,omitempty" jsonschema:"Accepted for compatibility; the bridge fixes the context window"`
 }
 
 type getMessageContextInput struct {
-	MessageID string `json:"message_id" jsonschema:"description:The ID of the message"`
-	Before    int    `json:"before" jsonschema:"default:5"`
-	After     int    `json:"after" jsonschema:"default:5"`
+	MessageID string `json:"message_id" jsonschema:"The ID of the message"`
+	Before    int    `json:"before,omitempty" jsonschema:"How many messages before it to include (default 5)"`
+	After     int    `json:"after,omitempty" jsonschema:"How many messages after it to include (default 5)"`
 }
 
 type listChatsInput struct {
-	Query              *string `json:"query,omitempty"`
-	Limit              int     `json:"limit" jsonschema:"default:20"`
-	Page               int     `json:"page" jsonschema:"default:0"`
-	IncludeLastMessage bool    `json:"include_last_message" jsonschema:"default:true"`
-	SortBy             string  `json:"sort_by" jsonschema:"default:last_active,enum:last_active|name"`
+	Query              *string `json:"query,omitempty" jsonschema:"Filter chats by name"`
+	Limit              int     `json:"limit,omitempty" jsonschema:"Maximum chats to return (default 20)"`
+	Page               int     `json:"page,omitempty" jsonschema:"Zero-based page of results (default 0)"`
+	IncludeLastMessage *bool   `json:"include_last_message,omitempty" jsonschema:"Include each chat's most recent message (default true)"`
+	SortBy             string  `json:"sort_by,omitempty" jsonschema:"Sort order: last_active or name (default last_active)"`
 }
 
 type getChatInput struct {
-	ChatJid            string `json:"chat_jid" jsonschema:"description:The JID of the chat"`
-	IncludeLastMessage bool   `json:"include_last_message" jsonschema:"default:true"`
+	ChatJid            string `json:"chat_jid" jsonschema:"The JID of the chat"`
+	IncludeLastMessage *bool  `json:"include_last_message,omitempty" jsonschema:"Include the chat's most recent message (default true)"`
 }
 
 type getDirectChatByContactInput struct {
@@ -157,8 +168,8 @@ type getDirectChatByContactInput struct {
 
 type getContactChatsInput struct {
 	Jid   string `json:"jid"`
-	Limit int    `json:"limit" jsonschema:"default:20"`
-	Page  int    `json:"page" jsonschema:"default:0"`
+	Limit int    `json:"limit,omitempty" jsonschema:"Maximum chats to return (default 20)"`
+	Page  int    `json:"page,omitempty" jsonschema:"Zero-based page of results (default 0)"`
 }
 
 type getLastInteractionInput struct {
@@ -188,6 +199,15 @@ type downloadMediaInput struct {
 type getLoginStatusInput struct{}
 
 type getPairingQrInput struct{}
+
+// defaultInt returns fallback when v is unset (zero) or nonsensical, standing in
+// for the schema defaults the struct tags could not express.
+func defaultInt(v, fallback int) int {
+	if v <= 0 {
+		return fallback
+	}
+	return v
+}
 
 func callAPI(method, path string, body any) ([]byte, error) {
 	token, err := GetOrRefreshJwtToken()
@@ -292,7 +312,10 @@ func searchContactsHandler(
 		return ErrResult("query is required"), nil, nil
 	}
 
-	data, err := callAPI(http.MethodGet, "/contacts/search?q="+in.Query, nil)
+	// Must be escaped: a raw space (e.g. "Руслан Шалтыков") lands in the HTTP
+	// request line and the bridge's net/http server rejects it with 400 before
+	// any handler runs.
+	data, err := callAPI(http.MethodGet, "/contacts/search?q="+url.QueryEscape(in.Query), nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}
@@ -313,28 +336,25 @@ func listMessagesHandler(
 	req *mcp.CallToolRequest,
 	in listMessagesInput,
 ) (*mcp.CallToolResult, any, error) {
-	q := ""
-	if in.After != nil {
-		q += "&after=" + *in.After
+	q := url.Values{}
+	for name, v := range map[string]*string{
+		"after":  in.After,
+		"before": in.Before,
+		"sender": in.SenderPhoneNumber,
+		"chat":   in.ChatJid,
+		"search": in.Query,
+	} {
+		if v != nil && *v != "" {
+			q.Set(name, *v)
+		}
 	}
-	if in.Before != nil {
-		q += "&before=" + *in.Before
-	}
-	if in.SenderPhoneNumber != nil {
-		q += "&sender=" + *in.SenderPhoneNumber
-	}
-	if in.ChatJid != nil {
-		q += "&chat=" + *in.ChatJid
-	}
-	if in.Query != nil {
-		q += "&search=" + *in.Query
-	}
-	q += fmt.Sprintf("&limit=%d&page=%d", in.Limit, in.Page)
-	if in.IncludeContext {
-		q += "&context=true"
+	q.Set("limit", strconv.Itoa(defaultInt(in.Limit, 20)))
+	q.Set("page", strconv.Itoa(max(in.Page, 0)))
+	if in.IncludeContext == nil || *in.IncludeContext {
+		q.Set("context", "true")
 	}
 
-	data, err := callAPI(http.MethodGet, "/messages?"+strings.TrimPrefix(q, "&"), nil)
+	data, err := callAPI(http.MethodGet, "/messages?"+q.Encode(), nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}
@@ -360,11 +380,20 @@ func downloadMediaHandler(
 			"message": msg,
 		}, nil
 	}
-	return &mcp.CallToolResult{}, map[string]any{
+	out := map[string]any{
 		"success":   true,
 		"message":   "Media downloaded successfully",
 		"file_path": path,
-	}, nil
+	}
+	// Publish it where files-mcp can actually serve it (it lists /shared
+	// non-recursively). Non-fatal: the download itself succeeded either way.
+	if name, err := linkIntoSharedRoot(sharedDir(), path); err != nil {
+		slog.Warn("could not publish media to the shared root", "path", path, "err", err)
+	} else {
+		out["shared_name"] = name
+		out["message"] = "Media downloaded successfully and published to the shared space as " + name
+	}
+	return &mcp.CallToolResult{}, out, nil
 }
 
 func getMessageContextHandler(
@@ -377,7 +406,7 @@ func getMessageContextHandler(
 	}
 
 	path := fmt.Sprintf("/messages/context/%s?before=%d&after=%d",
-		in.MessageID, in.Before, in.After)
+		url.PathEscape(in.MessageID), defaultInt(in.Before, 5), defaultInt(in.After, 5))
 
 	data, err := callAPI(http.MethodGet, path, nil)
 	if err != nil {
@@ -397,15 +426,15 @@ func listChatsHandler(
 	req *mcp.CallToolRequest,
 	in listChatsInput,
 ) (*mcp.CallToolResult, any, error) {
-	q := fmt.Sprintf("?limit=%d&page=%d", in.Limit, in.Page)
+	q := url.Values{}
+	q.Set("limit", strconv.Itoa(defaultInt(in.Limit, 20)))
+	q.Set("page", strconv.Itoa(max(in.Page, 0)))
 	if in.Query != nil && *in.Query != "" {
-		q += "&q=" + *in.Query
+		q.Set("q", *in.Query)
 	}
-	if in.SortBy != "" {
-		q += "&sort=" + in.SortBy
-	}
+	q.Set("sort", cmp.Or(in.SortBy, "last_active"))
 
-	data, err := callAPI(http.MethodGet, "/chats"+q, nil)
+	data, err := callAPI(http.MethodGet, "/chats?"+q.Encode(), nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}
@@ -428,7 +457,7 @@ func getChatHandler(
 		return ErrResult("chat_jid is required"), nil, nil
 	}
 
-	data, err := callAPI(http.MethodGet, "/chats/"+in.ChatJid, nil)
+	data, err := callAPI(http.MethodGet, "/chats/"+url.PathEscape(in.ChatJid), nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}
@@ -451,7 +480,7 @@ func getDirectChatByContactHandler(
 	}
 
 	// GET /api/direct-contacts/{phone}/chat
-	path := fmt.Sprintf("/direct-contacts/%s/chat", in.SenderPhoneNumber)
+	path := fmt.Sprintf("/direct-contacts/%s/chat", url.PathEscape(in.SenderPhoneNumber))
 
 	data, err := callAPI(http.MethodGet, path, nil)
 	if err != nil {
@@ -498,7 +527,7 @@ func getContactChatsHandler(
 	}
 
 	// GET /api/contacts/{jid}/chats?limit=...&page=...
-	path := fmt.Sprintf("/contacts/%s/chats?limit=%d&page=%d", in.Jid, limit, page)
+	path := fmt.Sprintf("/contacts/%s/chats?limit=%d&page=%d", url.PathEscape(in.Jid), limit, page)
 
 	data, err := callAPI(http.MethodGet, path, nil)
 	if err != nil {
@@ -526,7 +555,7 @@ func getLastInteractionHandler(
 	}
 
 	// We simulate it by asking for 1 message from that sender
-	data, err := callAPI(http.MethodGet, "/messages?sender="+in.Jid+"&limit=1", nil)
+	data, err := callAPI(http.MethodGet, "/messages?"+url.Values{"sender": {in.Jid}, "limit": {"1"}}.Encode(), nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}

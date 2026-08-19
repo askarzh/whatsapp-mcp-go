@@ -41,6 +41,12 @@ type Config struct {
 	AuthLoginRate string
 	// MediaDirs are the only directories /api/send may read media files from.
 	MediaDirs []string
+
+	// MediaDownloadDir is where /api/download writes decrypted media. It
+	// defaults to the bridge's private "store", which no other container can
+	// read — point it at a shared mount (e.g. /shared/whatsapp) when the file
+	// has to be reachable by files-mcp or the MCP server.
+	MediaDownloadDir string
 }
 
 func LoadConfig() (*Config, error) {
@@ -102,9 +108,20 @@ func LoadConfig() (*Config, error) {
 
 	// Default allows the bridge's own store plus the OS temp dir (the MCP
 	// server writes converted voice notes there in same-host deployments).
-	mediaDirs := []string{"store", os.TempDir()}
+	mediaDownloadDir := os.Getenv("MEDIA_DOWNLOAD_DIR")
+	if mediaDownloadDir == "" {
+		mediaDownloadDir = "store"
+	}
+
+	// Default: the download dir plus the OS temp dir (the MCP server writes
+	// converted voice notes there in same-host deployments), so a file the
+	// bridge just downloaded can be sent back out. An explicit
+	// MEDIA_ALLOWED_DIRS is an allowlist and stays authoritative.
+	mediaDirs := []string{"store", mediaDownloadDir, os.TempDir()}
 	if v := os.Getenv("MEDIA_ALLOWED_DIRS"); v != "" {
 		mediaDirs = strings.Split(v, ":")
+	} else if mediaDownloadDir == "store" {
+		mediaDirs = []string{"store", os.TempDir()}
 	}
 
 	return &Config{
@@ -116,13 +133,14 @@ func LoadConfig() (*Config, error) {
 			IsPostgres: isPostgres,
 			SSLMode:    sslMode,
 		},
-		JWTSecret:     []byte(jwtSecret),
-		APIKey:        apiKey,
-		WebhookUrl:    webhookUrl,
-		Host:          serverHost,
-		Port:          serverPort,
-		AuthLoginRate: authLoginRate,
-		MediaDirs:     mediaDirs,
+		JWTSecret:        []byte(jwtSecret),
+		APIKey:           apiKey,
+		WebhookUrl:       webhookUrl,
+		Host:             serverHost,
+		Port:             serverPort,
+		AuthLoginRate:    authLoginRate,
+		MediaDirs:        mediaDirs,
+		MediaDownloadDir: mediaDownloadDir,
 	}, nil
 }
 
