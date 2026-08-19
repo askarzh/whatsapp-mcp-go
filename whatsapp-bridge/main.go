@@ -727,7 +727,7 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 }
 
 // Function to download media from a message
-func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
+func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID, downloadDir string) (bool, string, string, string, error) {
 	var mediaType, filename, url string
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
 	var fileLength uint64
@@ -735,7 +735,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	// chatJID comes from the request and filename from the sender of the
 	// message; both must be confined to the store directory.
-	chatDir, err := safeChildPath("store", chatJID)
+	chatDir, err := safeChildPath(downloadDir, chatJID)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("invalid chat JID: %v", err)
 	}
@@ -837,11 +837,10 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	return "/" + pathPart
+	// Keep the query string. whatsmeow re-signs nothing: DownloadMediaWithPath
+	// appends "&hash=...&mms-type=...&__wa-mms=" to this path, so WhatsApp's own
+	// ?ccb/oh/oe/_nc_sid params must still be attached or the CDN returns 403.
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -915,7 +914,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			return
 		}
 
-		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
+		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID, cfg.MediaDownloadDir)
 
 		w.Header().Set("Content-Type", "application/json")
 

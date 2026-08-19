@@ -1,11 +1,8 @@
 package helpers
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -70,24 +67,16 @@ func SendMessage(recipient, message string) (bool, string) {
 		"message":   message,
 	}
 
-	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", apiBaseURL+"/send", bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	// Every /api route on the bridge sits behind JwtAuthMiddleware, so the call
+	// must go through callAPI — it mints/refreshes the JWT and sets the bearer.
+	// Building the request here by hand is what made these tools 401.
+	data, err := callAPI(http.MethodPost, "/send", payload)
 	if err != nil {
-		return false, "Request error: " + err.Error()
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return false, fmt.Sprintf("HTTP %d - %s", resp.StatusCode, string(body))
+		return false, err.Error()
 	}
 
 	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(data, &result); err != nil {
 		return false, "Failed to parse response"
 	}
 
@@ -116,24 +105,16 @@ func SendFile(recipient, mediaPath string) (bool, string) {
 		"media_path": mediaPath,
 	}
 
-	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", apiBaseURL+"/send", bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	// Every /api route on the bridge sits behind JwtAuthMiddleware, so the call
+	// must go through callAPI — it mints/refreshes the JWT and sets the bearer.
+	// Building the request here by hand is what made these tools 401.
+	data, err := callAPI(http.MethodPost, "/send", payload)
 	if err != nil {
-		return false, "Request error: " + err.Error()
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return false, fmt.Sprintf("HTTP %d - %s", resp.StatusCode, string(body))
+		return false, err.Error()
 	}
 
 	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(data, &result); err != nil {
 		return false, "Failed to parse response"
 	}
 
@@ -177,24 +158,16 @@ func SendAudioVoiceMessage(recipient, mediaPath string) (bool, string) {
 		"media_path": finalPath,
 	}
 
-	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", apiBaseURL+"/send", bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	// Every /api route on the bridge sits behind JwtAuthMiddleware, so the call
+	// must go through callAPI — it mints/refreshes the JWT and sets the bearer.
+	// Building the request here by hand is what made these tools 401.
+	data, err := callAPI(http.MethodPost, "/send", payload)
 	if err != nil {
-		return false, "Request error: " + err.Error()
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return false, fmt.Sprintf("HTTP %d - %s", resp.StatusCode, string(body))
+		return false, err.Error()
 	}
 
 	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(data, &result); err != nil {
 		return false, "Failed to parse response"
 	}
 
@@ -213,24 +186,14 @@ func DownloadMedia(messageID, chatJID string) (string, error) {
 		"chat_jid":   chatJID,
 	}
 
-	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", apiBaseURL+"/download", bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	// Same JWT gate as /send — see the note in SendMessage.
+	data, err := callAPI(http.MethodPost, "/download", payload)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("HTTP %d - %s", resp.StatusCode, string(body))
-	}
 
 	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(data, &result); err != nil {
 		return "", err
 	}
 
