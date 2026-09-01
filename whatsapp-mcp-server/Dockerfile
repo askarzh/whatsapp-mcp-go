@@ -1,5 +1,5 @@
 # Build the MCP server binary
-FROM golang:1.25.7 AS builder
+FROM golang:1.26.7 AS builder
 
 ARG TARGETARCH
 ARG TARGETOS
