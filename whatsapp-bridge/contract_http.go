@@ -4,7 +4,6 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -29,6 +28,12 @@ type contractDeps struct {
 	Media    mediaFetcher
 	Sender   messageSender
 	Login    *loginFlow
+
+	// contactsAvailable is probed once, at mux construction: on some
+	// deployments (SQLite, whatsmeow's tables in a separate database file
+	// from the messages one) whatsmeow_contacts simply isn't reachable from
+	// this store, and /contacts has to say so rather than 500.
+	contactsAvailable bool
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -55,6 +60,7 @@ func bearerGate(token string, next http.Handler) http.Handler {
 }
 
 func newContractMux(d *contractDeps) http.Handler {
+	d.contactsAvailable = d.Store.HasContacts()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", d.health)
 	mux.HandleFunc("GET /messages", d.messages)
@@ -66,7 +72,11 @@ func newContractMux(d *contractDeps) http.Handler {
 }
 
 func (d *contractDeps) capabilities() []string {
-	return []string{"messages", "chats", "contacts", "media", "send", "login"}
+	caps := []string{"messages", "chats"}
+	if d.contactsAvailable {
+		caps = append(caps, "contacts")
+	}
+	return append(caps, "media", "send", "login")
 }
 
 func (d *contractDeps) health(w http.ResponseWriter, r *http.Request) {
@@ -173,9 +183,14 @@ type contractContact struct {
 }
 
 func (d *contractDeps) contacts(w http.ResponseWriter, r *http.Request) {
+	if !d.contactsAvailable {
+		writeErr(w, http.StatusNotFound, "contacts not available")
+		return
+	}
 	list, err := d.Store.ListContactsForContract()
 	if err != nil {
-		writeErr(w, 500, fmt.Sprintf("store error: %v", err))
+		slog.Error("contract contacts", "err", err)
+		writeErr(w, 500, "store error")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"contacts": list})

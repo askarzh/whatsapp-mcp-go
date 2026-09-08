@@ -29,9 +29,15 @@ func contractDepsOf(srv *httptest.Server) *contractDeps {
 	return contractDepsBySrv[srv]
 }
 
-func newContractServer(t *testing.T) (*httptest.Server, *MessageStore, *wastate.State) {
+// setup runs against the store before the mux is built, so a test that needs
+// whatsmeow's tables in place for the contacts-availability probe (run once,
+// at mux construction) can create them in time.
+func newContractServer(t *testing.T, setup ...func(*MessageStore)) (*httptest.Server, *MessageStore, *wastate.State) {
 	t.Helper()
 	s := newTestMessageStore(t)
+	for _, fn := range setup {
+		fn(s)
+	}
 	st := wastate.New()
 	st.SetConnected(true)
 	st.SetLoggedIn(true)
@@ -146,9 +152,20 @@ func TestMessagesPagingCursorAndUntil(t *testing.T) {
 }
 
 func TestChatsAndContacts(t *testing.T) {
-	srv, s, _ := newContractServer(t)
-	mustExec(t, s.db, `INSERT INTO chats (jid, name) VALUES
-		('77000000001@s.whatsapp.net', 'engineer'), ('120363000000000000@g.us', 'tender team'), ('1@newsletter', 'news')`)
+	srv, _, _ := newContractServer(t, func(s *MessageStore) {
+		mustExec(t, s.db, `INSERT INTO chats (jid, name) VALUES
+			('77000000001@s.whatsapp.net', 'engineer'), ('120363000000000000@g.us', 'tender team'), ('1@newsletter', 'news')`)
+		mustExec(t, s.db, `CREATE TABLE IF NOT EXISTS whatsmeow_contacts (our_jid TEXT, their_jid TEXT, first_name TEXT, full_name TEXT, push_name TEXT, business_name TEXT)`)
+		mustExec(t, s.db, `CREATE TABLE IF NOT EXISTS whatsmeow_lid_map (lid TEXT, pn TEXT)`)
+		mustExec(t, s.db, `INSERT INTO whatsmeow_contacts VALUES ('me', '77000000001@s.whatsapp.net', 'eng', 'engineer example', 'eng', '')`)
+		mustExec(t, s.db, `INSERT INTO whatsmeow_lid_map VALUES ('1839000000000000', '77000000001')`) // bare user parts, as whatsmeow stores them
+		// an @lid contact the lid map cannot resolve: gets its own row, key null
+		mustExec(t, s.db, `INSERT INTO whatsmeow_contacts VALUES ('me', '9990000000000000@lid', '', 'unlinked lid', '', '')`)
+		// an @lid contact the lid map DOES resolve: must not appear as its own
+		// row — it is already the alias on the phone row above
+		mustExec(t, s.db, `INSERT INTO whatsmeow_contacts VALUES ('me', '1839000000000000@lid', '', 'should be hidden', '', '')`)
+	})
+
 	_, c := get(t, srv.URL+"/bridge/v1/chats", testToken)
 	kinds := map[string]string{}
 	for _, x := range c["chats"].([]any) {
@@ -158,20 +175,49 @@ func TestChatsAndContacts(t *testing.T) {
 	if kinds["77000000001@s.whatsapp.net"] != "direct" || kinds["120363000000000000@g.us"] != "group" || kinds["1@newsletter"] != "feed" {
 		t.Fatalf("%v", kinds)
 	}
-	mustExec(t, s.db, `CREATE TABLE IF NOT EXISTS whatsmeow_contacts (our_jid TEXT, their_jid TEXT, first_name TEXT, full_name TEXT, push_name TEXT, business_name TEXT)`)
-	mustExec(t, s.db, `CREATE TABLE IF NOT EXISTS whatsmeow_lid_map (lid TEXT, pn TEXT)`)
-	mustExec(t, s.db, `INSERT INTO whatsmeow_contacts VALUES ('me', '77000000001@s.whatsapp.net', 'eng', 'engineer example', 'eng', '')`)
-	mustExec(t, s.db, `INSERT INTO whatsmeow_lid_map VALUES ('1839000000000000', '77000000001')`) // bare user parts, as whatsmeow stores them
+
 	_, ct := get(t, srv.URL+"/bridge/v1/contacts", testToken)
 	list := ct["contacts"].([]any)
-	if len(list) != 1 {
+	if len(list) != 2 {
 		t.Fatalf("%+v", ct)
 	}
-	one := list[0].(map[string]any)
-	if one["key"] != "e164:+77000000001" || one["name"] != "engineer example" {
-		t.Fatalf("%+v", one)
+	byNative := map[string]map[string]any{}
+	for _, x := range list {
+		m := x.(map[string]any)
+		byNative[m["native_id"].(string)] = m
+	}
+
+	one := byNative["77000000001@s.whatsapp.net"]
+	if one == nil || one["key"] != "e164:+77000000001" || one["name"] != "engineer example" {
+		t.Fatalf("phone row: %+v", one)
 	}
 	if al := one["aliases"].([]any); len(al) != 1 || al[0].(map[string]any)["value"] != "1839000000000000@lid" {
 		t.Fatalf("aliases: %+v", one["aliases"])
+	}
+
+	unmapped := byNative["9990000000000000@lid"]
+	if unmapped == nil || unmapped["key"] != nil || unmapped["name"] != "unlinked lid" {
+		t.Fatalf("unmapped lid row: %+v", unmapped)
+	}
+
+	if _, seen := byNative["1839000000000000@lid"]; seen {
+		t.Fatalf("mapped lid contact must not appear as its own row: %+v", ct)
+	}
+}
+
+// Some deployments never get whatsmeow_contacts in the same database this
+// bridge can query (SQLite: it lives in a different file). The contract must
+// not 500 on that — it drops "contacts" from health and answers 404.
+func TestContactsUnavailable(t *testing.T) {
+	srv, _, _ := newContractServer(t) // no whatsmeow_contacts table
+	_, h := get(t, srv.URL+"/bridge/v1/health", testToken)
+	for _, c := range h["capabilities"].([]any) {
+		if c == "contacts" {
+			t.Fatalf("capabilities must not list contacts when the table is unreachable: %v", h["capabilities"])
+		}
+	}
+	r, body := get(t, srv.URL+"/bridge/v1/contacts", testToken)
+	if r.StatusCode != http.StatusNotFound || body["error"] != "contacts not available" {
+		t.Fatalf("contacts without the table: %d %+v", r.StatusCode, body)
 	}
 }

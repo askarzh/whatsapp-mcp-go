@@ -2,7 +2,9 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -236,26 +238,50 @@ func (store *MessageStore) ListChatsForContract() ([]contractChat, error) {
 	return out, rows.Err()
 }
 
-// Contacts come from whatsmeow's own address-book table, with every linked id
-// the lid map knows for the same phone as an alias (spec §4).
+// nameFallback mirrors SearchContacts (main.go:2114): full_name, then
+// first_name, then push_name.
+const nameFallbackSQL = `coalesce(nullif(full_name,''), nullif(first_name,''), nullif(push_name,''), '')`
+
+// HasContacts probes whether whatsmeow's own address-book table is reachable
+// from this store's database. On some deployments (SQLite: whatsmeow keeps
+// its tables in store/whatsapp.db, a different file from store/messages.db)
+// it is not, and the contract has to know that up front rather than 500ing
+// on every call to /contacts.
+func (store *MessageStore) HasContacts() bool {
+	var one int
+	err := store.db.QueryRow(`SELECT 1 FROM whatsmeow_contacts LIMIT 1`).Scan(&one)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		slog.Warn("contract: whatsmeow_contacts not reachable; /contacts disabled", "err", err)
+		return false
+	}
+	return true
+}
+
+// Contacts come from whatsmeow's own address-book table. A phone row carries
+// every linked id the lid map knows for the same number as an alias (spec
+// §4); a @lid row with no mapping to a phone is emitted on its own, with no
+// key — the roster is left to bind it. A @lid row that IS mapped is skipped
+// here: it already went out as an alias on the phone row, and listing it
+// again would double the same person.
 func (store *MessageStore) ListContactsForContract() ([]contractContact, error) {
 	agg := "group_concat"
 	if isPostgres {
 		agg = "string_agg"
 	}
+	out := []contractContact{}
+
 	// lid and pn in whatsmeow_lid_map are bare user parts; the alias goes out
 	// as a full JID so the raw id matches what a message's author carries.
-	rows, err := store.db.Query(fmt.Sprintf(`SELECT c.their_jid, coalesce(nullif(c.full_name,''), nullif(c.push_name,''), '') AS name,
+	phoneRows, err := store.db.Query(fmt.Sprintf(`SELECT c.their_jid, %s AS name,
 		coalesce((SELECT %s(l.lid || '@lid', ',') FROM whatsmeow_lid_map l WHERE l.pn || '@s.whatsapp.net' = c.their_jid), '') AS lids
-		FROM whatsmeow_contacts c WHERE c.their_jid LIKE '%%@s.whatsapp.net' ORDER BY c.their_jid`, agg))
+		FROM whatsmeow_contacts c WHERE c.their_jid LIKE '%%@s.whatsapp.net' ORDER BY c.their_jid`, nameFallbackSQL, agg))
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := []contractContact{}
-	for rows.Next() {
+	for phoneRows.Next() {
 		var jid, name, lids string
-		if err := rows.Scan(&jid, &name, &lids); err != nil {
+		if err := phoneRows.Scan(&jid, &name, &lids); err != nil {
+			phoneRows.Close()
 			return nil, err
 		}
 		c := contractContact{NativeID: jid, Aliases: []rawID{}}
@@ -274,5 +300,34 @@ func (store *MessageStore) ListContactsForContract() ([]contractContact, error) 
 		}
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	if err := phoneRows.Err(); err != nil {
+		phoneRows.Close()
+		return nil, err
+	}
+	phoneRows.Close()
+
+	// @lid rows the lid map cannot resolve to a phone: their own row, key
+	// null, no aliases.
+	lidRows, err := store.db.Query(fmt.Sprintf(`SELECT c.their_jid, %s AS name
+		FROM whatsmeow_contacts c
+		WHERE c.their_jid LIKE '%%@lid'
+		  AND NOT EXISTS (SELECT 1 FROM whatsmeow_lid_map l WHERE l.lid || '@lid' = c.their_jid)
+		ORDER BY c.their_jid`, nameFallbackSQL))
+	if err != nil {
+		return nil, err
+	}
+	defer lidRows.Close()
+	for lidRows.Next() {
+		var jid, name string
+		if err := lidRows.Scan(&jid, &name); err != nil {
+			return nil, err
+		}
+		c := contractContact{NativeID: jid, Aliases: []rawID{}}
+		if name != "" {
+			n := name
+			c.Name = &n
+		}
+		out = append(out, c)
+	}
+	return out, lidRows.Err()
 }

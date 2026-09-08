@@ -8,7 +8,7 @@ import (
 func TestArrivalSequenceFollowsInsertOrderNotSentAt(t *testing.T) {
 	s := newTestMessageStore(t)
 	mustExec(t, s.db, `INSERT INTO chats (jid, name) VALUES ('77000000001@s.whatsapp.net', 'x')`)
-	late := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)   // old sent_at, arrives second
+	late := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC) // old sent_at, arrives second
 	fresh := time.Date(2026, 9, 7, 8, 0, 0, 0, time.UTC)
 	if err := s.StoreMessage("fresh", "77000000001@s.whatsapp.net", "77000000001", "new", fresh, false, "", "", "", nil, nil, nil, 0); err != nil {
 		t.Fatal(err)
