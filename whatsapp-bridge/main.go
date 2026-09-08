@@ -709,10 +709,12 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// chatJID comes from the request and filename from the sender of the
-	// message; both must be confined to the store directory.
+	// message; both must be confined to the store directory. A refusal here
+	// is never something a retry will fix — there is no file to ask for
+	// under a JID or filename that can't even be turned into a path.
 	chatDir, err := safeChildPath(downloadDir, chatJID)
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("invalid chat JID: %v", err)
+		return false, "", "", "", fmt.Errorf("%w: invalid chat JID: %v", errMediaUnknown, err)
 	}
 	localPath := ""
 
@@ -732,12 +734,18 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		}
 
 		if err != nil {
-			return false, "", "", "", fmt.Errorf("%w: %v", errMediaUnknown, err)
+			// Only "no such row" means the message itself is unknown; any
+			// other database error (a dropped connection, say) is worth
+			// retrying and must not be mistaken for a permanent 404.
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, "", "", "", fmt.Errorf("%w: %v", errMediaUnknown, err)
+			}
+			return false, "", "", "", fmt.Errorf("failed to find message: %v", err)
 		}
 	}
 
 	if mediaType == "" {
-		return false, "", "", "", fmt.Errorf("not a media message")
+		return false, "", "", "", fmt.Errorf("%w: not a media message", errMediaUnknown)
 	}
 
 	if err := os.MkdirAll(chatDir, 0755); err != nil {
@@ -746,7 +754,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	localPath, err = safeChildPath(chatDir, filename)
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("invalid media filename: %v", err)
+		return false, "", "", "", fmt.Errorf("%w: invalid media filename: %v", errMediaUnknown, err)
 	}
 
 	absPath, err := filepath.Abs(localPath)
@@ -777,7 +785,9 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	case "document":
 		waMediaType = whatsmeow.MediaDocument
 	default:
-		return false, "", "", "", fmt.Errorf("unsupported media type: %s", mediaType)
+		// A media_type this bridge itself never writes is data, not a
+		// hiccup: no retry teaches it a fifth kind.
+		return false, "", "", "", fmt.Errorf("%w: unsupported media type %q", errMediaUnknown, mediaType)
 	}
 
 	downloader := &MediaDownloader{
@@ -792,14 +802,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
-		var httpErr whatsmeow.DownloadHTTPError
-		if errors.As(err, &httpErr) && (httpErr.Response.StatusCode == 403 || httpErr.Response.StatusCode == 404 || httpErr.Response.StatusCode == 410) {
-			return false, "", "", "", fmt.Errorf("%w: cdn %d", errMediaGone, httpErr.Response.StatusCode)
-		}
-		if errors.Is(err, whatsmeow.ErrNoURLPresent) {
-			return false, "", "", "", fmt.Errorf("%w: %v", errMediaGone, err)
-		}
-		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+		return false, "", "", "", classifyDownloadErr(err)
 	}
 
 	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
@@ -808,6 +811,27 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	slog.Info("successfully downloaded media", "media_type", mediaType, "path", absPath, "bytes", len(mediaData))
 	return true, mediaType, filename, absPath, nil
+}
+
+// classifyDownloadErr says how Mindet should treat a client.Download
+// failure: a CDN 403/404/410 or a missing url is gone for good (§3.5's 410);
+// so are whatsmeow's own deterministic decrypt errors — the plaintext will
+// never hash right, the HMAC will never verify, the file will never grow —
+// no retry changes any of that. Anything else (a dropped connection, a
+// timeout) is left as a plain error, retried as a transient 500.
+func classifyDownloadErr(err error) error {
+	var httpErr whatsmeow.DownloadHTTPError
+	if errors.As(err, &httpErr) && (httpErr.Response.StatusCode == 403 || httpErr.Response.StatusCode == 404 || httpErr.Response.StatusCode == 410) {
+		return fmt.Errorf("%w: cdn %d", errMediaGone, httpErr.Response.StatusCode)
+	}
+	switch {
+	case errors.Is(err, whatsmeow.ErrNoURLPresent),
+		errors.Is(err, whatsmeow.ErrInvalidMediaSHA256),
+		errors.Is(err, whatsmeow.ErrInvalidMediaHMAC),
+		errors.Is(err, whatsmeow.ErrTooShortFile):
+		return fmt.Errorf("%w: %v", errMediaGone, err)
+	}
+	return fmt.Errorf("failed to download media: %v", err)
 }
 
 func extractDirectPathFromURL(url string) string {

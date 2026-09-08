@@ -332,15 +332,50 @@ func (store *MessageStore) ListContactsForContract() ([]contractContact, error) 
 	return out, lidRows.Err()
 }
 
-// RememberSend and RecallSend back the idempotency key on /bridge/v1/send
-// (spec §3.6): a repeated key must answer from memory rather than send
-// again, so the key is written before the reply goes out.
-func (store *MessageStore) RememberSend(key, nativeID string, sentAt time.Time) error {
-	_, err := store.db.Exec(fmt.Sprintf(`INSERT INTO sent_by_key (idempotency_key, native_id, sent_at_unix) VALUES (%s, %s, %s)
-		ON CONFLICT (idempotency_key) DO NOTHING`, placeholder(1), placeholder(2), placeholder(3)), key, nativeID, sentAt.Unix())
+// ReserveSend, CompleteSend, ReleaseSend and RecallSend back the idempotency
+// key on /bridge/v1/send (spec §3.6). A check-then-act ("is this key known?
+// then send") lets two concurrent requests with the same key both reach
+// WhatsApp, so the key is reserved — a row with an empty native_id — before
+// the send happens; CompleteSend fills it in once the send actually
+// succeeds, and ReleaseSend removes the reservation after a failed send so a
+// retry with the same key is free to try again.
+
+// ReserveSend claims key for a send that is about to happen. It reports
+// whether this call made the reservation: false means the key was already
+// there, either as a finished send (RecallSend has the answer) or as another
+// request's send still in flight.
+func (store *MessageStore) ReserveSend(key string) (bool, error) {
+	res, err := store.db.Exec(fmt.Sprintf(`INSERT INTO sent_by_key (idempotency_key, native_id, sent_at_unix) VALUES (%s, '', 0)
+		ON CONFLICT (idempotency_key) DO NOTHING`, placeholder(1)), key)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// CompleteSend fills in a reservation once the send has actually happened.
+func (store *MessageStore) CompleteSend(key, nativeID string, sentAt time.Time) error {
+	_, err := store.db.Exec(fmt.Sprintf(`UPDATE sent_by_key SET native_id = %s, sent_at_unix = %s WHERE idempotency_key = %s`,
+		placeholder(1), placeholder(2), placeholder(3)), nativeID, sentAt.Unix(), key)
 	return err
 }
 
+// ReleaseSend drops a reservation that never turned into a send, so the same
+// key can be retried.
+func (store *MessageStore) ReleaseSend(key string) error {
+	_, err := store.db.Exec(fmt.Sprintf(`DELETE FROM sent_by_key WHERE idempotency_key = %s`, placeholder(1)), key)
+	return err
+}
+
+// RecallSend answers a repeated request from what was recorded before. A row
+// with an empty native_id is a reservation still being worked on, not a
+// result — RecallSend reports that as "not found" (ok == false), same as no
+// row at all; the handler tells the two apart by having just tried
+// ReserveSend itself.
 func (store *MessageStore) RecallSend(key string) (string, time.Time, bool, error) {
 	var id string
 	var at int64
@@ -351,6 +386,9 @@ func (store *MessageStore) RecallSend(key string) (string, time.Time, bool, erro
 	}
 	if err != nil {
 		return "", time.Time{}, false, err
+	}
+	if id == "" {
+		return "", time.Time{}, false, nil
 	}
 	return id, time.Unix(at, 0).UTC(), true, nil
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -284,9 +285,19 @@ func (f *fakeMedia) Fetch(id, chat string) (string, error) {
 	return p, nil
 }
 
-type fakeSender struct{ sent []string }
+// failNext, when set, makes the next Send fail instead of sending, then
+// clears itself — so a test can fail one attempt and let a retry through.
+type fakeSender struct {
+	sent     []string
+	failNext bool
+	failErr  error
+}
 
 func (f *fakeSender) Send(chat, text, media string) (string, time.Time, error) {
+	if f.failNext {
+		f.failNext = false
+		return "", time.Time{}, f.failErr
+	}
 	f.sent = append(f.sent, chat+":"+text)
 	return fmt.Sprintf("SENT%d", len(f.sent)), time.Date(2026, 9, 8, 9, 0, 0, 0, time.UTC), nil
 }
@@ -329,5 +340,35 @@ func TestSendIsIdempotentOnKey(t *testing.T) {
 	}
 	if r, _ := post(t, srv.URL+"/bridge/v1/send", testToken, `{"to":{"chat":"c"},"text":"x"}`); r.StatusCode != 400 {
 		t.Fatalf("missing key must be 400, got %d", r.StatusCode)
+	}
+}
+
+// A reservation with an empty native_id is a send still in flight — a second
+// request with the same key must not reach the sender at all.
+func TestSendInFlightAnswers409WithoutCallingSender(t *testing.T) {
+	srv, s, _ := newContractServer(t)
+	fs := &fakeSender{}
+	setSender(srv, fs)
+	mustExec(t, s.db, `INSERT INTO sent_by_key (idempotency_key, native_id, sent_at_unix) VALUES ('k2', '', 0)`)
+	r, body := post(t, srv.URL+"/bridge/v1/send", testToken, `{"idempotency_key":"k2","to":{"chat":"c@s.whatsapp.net"},"text":"hi"}`)
+	if r.StatusCode != 409 || body["error"] != "send in flight" || len(fs.sent) != 0 {
+		t.Fatalf("in-flight: %d %+v sent=%v", r.StatusCode, body, fs.sent)
+	}
+}
+
+// A failed send must release its reservation: the key was never actually
+// used, so a retry has to be free to try again.
+func TestFailedSendReleasesTheKeyForARetry(t *testing.T) {
+	srv, _, _ := newContractServer(t)
+	fs := &fakeSender{failNext: true, failErr: errors.New("upstream unreachable")}
+	setSender(srv, fs)
+	body := `{"idempotency_key":"k3","to":{"chat":"c@s.whatsapp.net"},"text":"hello"}`
+	r1, _ := post(t, srv.URL+"/bridge/v1/send", testToken, body)
+	if r1.StatusCode != 502 {
+		t.Fatalf("first attempt should fail with 502, got %d", r1.StatusCode)
+	}
+	r2, a := post(t, srv.URL+"/bridge/v1/send", testToken, body)
+	if r2.StatusCode != 200 || len(fs.sent) != 1 || a["native_id"] == nil {
+		t.Fatalf("retry after a failed send should succeed: %d %+v sent=%v", r2.StatusCode, a, fs.sent)
 	}
 }

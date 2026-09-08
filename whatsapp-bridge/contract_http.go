@@ -266,39 +266,64 @@ type sendRequest struct {
 	Files []string `json:"files"`
 }
 
-// send is idempotent on the caller's key (spec §3.6): the key is remembered
-// before the reply is written, so a crash between the send and the reply
-// still leaves one message, not two, and a retried request after a lost
-// reply answers from memory instead of sending the boss the same text twice.
-// One file per send in v1; a second file is a second send.
+// send is idempotent on the caller's key (spec §3.6). The key is reserved
+// before the send happens, not remembered after: two concurrent requests
+// with the same key would otherwise both pass a "have I seen this?" check
+// and both reach WhatsApp. The loser of the race sees its own reservation
+// already there and answers 409 — the sender was never called — until the
+// winner's CompleteSend turns it into an answer either request can replay.
+// A failed send releases the reservation so a retry may go through. One file
+// per send in v1; a second file is a second send.
 func (d *contractDeps) send(w http.ResponseWriter, r *http.Request) {
 	var req sendRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.IdempotencyKey == "" || req.To.Chat == "" {
 		writeErr(w, 400, "idempotency_key, to.chat required")
 		return
 	}
-	if id, at, ok, err := d.Store.RecallSend(req.IdempotencyKey); err != nil {
+	reserved, err := d.Store.ReserveSend(req.IdempotencyKey)
+	if err != nil {
 		writeErr(w, 500, "store error")
 		return
-	} else if ok {
-		writeJSON(w, 200, map[string]any{"native_id": id, "sent_at": fmtTime(at)})
+	}
+	if !reserved {
+		id, at, ok, err := d.Store.RecallSend(req.IdempotencyKey)
+		if err != nil {
+			writeErr(w, 500, "store error")
+			return
+		}
+		if ok {
+			writeJSON(w, 200, map[string]any{"native_id": id, "sent_at": fmtTime(at)})
+			return
+		}
+		writeErr(w, 409, "send in flight")
 		return
 	}
 	media := ""
 	if len(req.Files) > 0 {
 		media = filepath.Join(d.Cfg.MediaSharedRoot, filepath.FromSlash(req.Files[0]))
 		if err := allowedMediaPath(d.Cfg.MediaDirs, media); err != nil {
+			if relErr := d.Store.ReleaseSend(req.IdempotencyKey); relErr != nil {
+				slog.Error("release send reservation", "key", req.IdempotencyKey, "err", relErr)
+			}
 			writeErr(w, 400, "file is outside the allowed directories: "+err.Error())
 			return
 		}
 	}
 	id, at, err := d.Sender.Send(req.To.Chat, req.Text, media)
 	if err != nil {
+		if relErr := d.Store.ReleaseSend(req.IdempotencyKey); relErr != nil {
+			slog.Error("release send reservation", "key", req.IdempotencyKey, "err", relErr)
+		}
 		writeErr(w, 502, err.Error())
 		return
 	}
-	if err := d.Store.RememberSend(req.IdempotencyKey, id, at); err != nil {
-		slog.Error("remember send", "err", err)
+	// The message is already on its way to WhatsApp: a failure from here on
+	// must not look like success, or a retry (thinking it never sent) would
+	// send it again with a fresh key.
+	if err := d.Store.CompleteSend(req.IdempotencyKey, id, at); err != nil {
+		slog.Error("complete send", "key", req.IdempotencyKey, "native_id", id, "err", err)
+		writeJSON(w, 500, map[string]any{"error": "sent but not recorded", "native_id": id, "sent_at": fmtTime(at)})
+		return
 	}
 	writeJSON(w, 200, map[string]any{"native_id": id, "sent_at": fmtTime(at)})
 }
