@@ -55,16 +55,27 @@ func TestLoginOffersAQRLinkThenAPairingCodeThenAuthenticates(t *testing.T) {
 	}
 }
 
+// With no QR loop running — the state after a logout at runtime, since
+// whatsmeow only opens that loop at startup — there is nothing to scan and
+// PairPhone has no connection to ask. A challenge with no display would send
+// the owner to a screen that never shows a code; the honest answer is that
+// this bridge needs a restart.
 func TestLoginFailsCleanlyWhenPairingIsImpossible(t *testing.T) {
 	st := wastate.New()
 	l := newLoginFlow(st, &fakePairer{fail: true}, "https://wa.example")
 	first := l.Step(nil, nil)
-	if first.Status != "in_progress" || first.Challenge.Display != nil {
-		t.Fatalf("with no QR yet the display is empty but the prompt still asks for a phone: %+v", first)
+	if first.Status != "failed" || first.Challenge != nil || !strings.Contains(first.Detail, "restart") {
+		t.Fatalf("with no QR there is nothing to offer: %+v", first)
+	}
+	// the phone-number door is shut for the same reason
+	st.SetPairingQRPNG([]byte("png"))
+	withQR := l.Step(nil, nil)
+	if withQR.Status != "in_progress" || withQR.Challenge == nil {
+		t.Fatalf("a QR makes it offerable again: %+v", withQR)
 	}
 	phone := "77000000001"
-	r := l.Step(&first.SessionID, &phone)
-	if r.Status != "failed" || r.Detail == "" {
+	r := l.Step(&withQR.SessionID, &phone)
+	if r.Status != "failed" || !strings.Contains(r.Detail, "restart") {
 		t.Fatalf("%+v", r)
 	}
 	unknown := "nope"

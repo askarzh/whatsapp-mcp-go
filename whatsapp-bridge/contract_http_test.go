@@ -144,6 +144,7 @@ func TestBearerGate(t *testing.T) {
 func TestQRRouteBypassesTheBearerGate(t *testing.T) {
 	srv, _, st := newContractServer(t)
 	st.SetLoggedIn(false)
+	st.SetPairingQRPNG([]byte("png")) // a QR loop is running, so there is something to offer
 	_, body := post(t, srv.URL+"/bridge/v1/login", testToken, `{}`)
 	challenge, _ := body["challenge"].(map[string]any)
 	if challenge == nil {

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -82,17 +83,25 @@ func digitsOnly(s string) string {
 	return b.String()
 }
 
+// noSessionDetail is the truth when the QR loop is not running: whatsmeow
+// opens it once, at startup, only when there is no session — so a logout at
+// runtime leaves nothing to scan and no way to pair from chat. Saying that
+// beats handing the owner a challenge with nothing in it, which is a prompt
+// that leads nowhere.
+const noSessionDetail = "this bridge lost its session and needs a restart before it can be paired"
+
+// challenge is nil when there is no QR to offer: see noSessionDetail.
 func (l *loginFlow) challenge(sess *loginSession) *loginChallenge {
-	c := &loginChallenge{
+	if l.state.PairingQRPNG() == nil {
+		return nil
+	}
+	return &loginChallenge{
 		Prompt:    "Open the link on any screen that is not the phone and scan it in WhatsApp › Linked devices. Or reply with the phone number to get a pairing code instead.",
 		InputType: "text",
-	}
-	if l.state.PairingQRPNG() != nil {
-		c.Display = &loginDisplay{Kind: "qr_link",
+		Display: &loginDisplay{Kind: "qr_link",
 			URL:       fmt.Sprintf("%s/bridge/v1/qr/%s", l.publicURL, sess.token),
-			ExpiresAt: fmtTime(sess.created.Add(qrLinkTTL))}
+			ExpiresAt: fmtTime(sess.created.Add(qrLinkTTL))},
 	}
-	return c
 }
 
 // evictExpiredLocked drops sessions whose QR link has expired. Called with
@@ -142,17 +151,24 @@ func (l *loginFlow) Step(sessionID *string, response *string) loginReply {
 	if response != nil && *response != "" {
 		phone := digitsOnly(*response)
 		if len(phone) < 8 {
-			reply := loginReply{SessionID: id, Status: "in_progress", Challenge: l.challenge(sess),
-				Detail: "that does not look like a phone number"}
+			c := l.challenge(sess)
 			l.mu.Unlock()
-			return reply
+			if c == nil {
+				return loginReply{SessionID: id, Status: "failed", Detail: noSessionDetail}
+			}
+			return loginReply{SessionID: id, Status: "in_progress", Challenge: c,
+				Detail: "that does not look like a phone number"}
 		}
 		l.mu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		code, err := l.pairer.PairPhone(ctx, phone)
 		if err != nil {
-			return loginReply{SessionID: id, Status: "failed", Detail: "pairing code unavailable: " + err.Error()}
+			// PairPhone needs a connected client; after a runtime logout
+			// there is none, and no amount of retrying from chat will make
+			// one. The owner needs the same restart the QR path needs.
+			slog.Warn("contract login: pairing code unavailable", "err", err)
+			return loginReply{SessionID: id, Status: "failed", Detail: noSessionDetail}
 		}
 		return loginReply{SessionID: id, Status: "in_progress", Challenge: &loginChallenge{
 			Prompt:    "In WhatsApp on the phone: Linked devices › Link a device › Link with phone number instead, then type this code.",
@@ -160,9 +176,12 @@ func (l *loginFlow) Step(sessionID *string, response *string) loginReply {
 			Display:   &loginDisplay{Kind: "pairing_code", Code: code, ExpiresAt: fmtTime(l.now().Add(3 * time.Minute))},
 		}}
 	}
-	reply := loginReply{SessionID: id, Status: "in_progress", Challenge: l.challenge(sess)}
+	c := l.challenge(sess)
 	l.mu.Unlock()
-	return reply
+	if c == nil {
+		return loginReply{SessionID: id, Status: "failed", Detail: noSessionDetail}
+	}
+	return loginReply{SessionID: id, Status: "in_progress", Challenge: c}
 }
 
 func (l *loginFlow) sessionByToken(token string) *loginSession {
