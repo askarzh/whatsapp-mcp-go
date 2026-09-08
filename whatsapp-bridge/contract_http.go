@@ -31,8 +31,6 @@ type messageSender interface {
 	Send(chat, text, mediaAbsPath string) (nativeID string, sentAt time.Time, err error)
 }
 
-type loginFlow struct{} // Task 5
-
 type contractDeps struct {
 	Store    *MessageStore
 	State    *wastate.State
@@ -81,8 +79,9 @@ func newContractMux(d *contractDeps) http.Handler {
 	mux.HandleFunc("GET /contacts", d.contacts)
 	mux.HandleFunc("GET /media/{id}", d.media)
 	mux.HandleFunc("POST /send", d.send)
-	// Task 5 adds POST /login and the unauthenticated /qr/{token} pages on
-	// the outer mux.
+	mux.HandleFunc("POST /login", d.login)
+	// The /qr/{token} pages carry their own secret in the path and are
+	// mounted unauthenticated on the outer default mux, not here.
 	return bearerGate(d.Cfg.MindetBridgeToken, mux)
 }
 
@@ -100,6 +99,9 @@ func (d *contractDeps) health(w http.ResponseWriter, r *http.Request) {
 	if !d.State.LoggedIn() {
 		auth = "needs_login"
 		detail = "no WhatsApp session: run the login flow"
+		if d.State.PairingQRPNG() == nil {
+			detail = "session lost; restart the bridge container, then run login"
+		}
 	}
 	var since *string
 	if !d.State.ConnectedSince().IsZero() {
@@ -326,4 +328,18 @@ func (d *contractDeps) send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"native_id": id, "sent_at": fmtTime(at)})
+}
+
+// login is one round of the challenge-response of spec §3.7a. The bridge
+// dictates every step; Mindet just relays the request and response bodies.
+func (d *contractDeps) login(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID *string `json:"session_id"`
+		Response  *string `json:"response"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "bad json")
+		return
+	}
+	writeJSON(w, 200, d.Login.Step(req.SessionID, req.Response))
 }

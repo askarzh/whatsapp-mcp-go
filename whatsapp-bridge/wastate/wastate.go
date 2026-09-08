@@ -14,6 +14,7 @@ type State struct {
 	connectedSince time.Time
 	loggedIn       bool
 	pairingQRPNG   []byte
+	qrCode         string
 	waVersion      string
 }
 
@@ -89,6 +90,22 @@ func (s *State) ClearPairingQR() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pairingQRPNG = nil
+	s.qrCode = ""
+}
+
+// SetPairingQRCode stores the raw QR string ("2@...") whatsmeow published,
+// for anything that needs it besides the PNG rendering (currently nothing
+// in this bridge, but it is cheap to keep in step with the PNG).
+func (s *State) SetPairingQRCode(code string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.qrCode = code
+}
+
+func (s *State) PairingQRCode() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.qrCode
 }
 
 func (s *State) WAVersion() string {

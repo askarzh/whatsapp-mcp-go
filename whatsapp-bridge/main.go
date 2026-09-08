@@ -868,6 +868,12 @@ func (s waSender) Send(chat, text, media string) (string, time.Time, error) {
 	return sendWhatsAppMessage(s.client, chat, text, media)
 }
 
+type waPairer struct{ client *whatsmeow.Client }
+
+func (p waPairer) PairPhone(ctx context.Context, phone string) (string, error) {
+	return p.client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *config.Config, state *wastate.State) {
 	apiMux := http.NewServeMux()
@@ -1329,8 +1335,15 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			},
 			Media:  waMedia{client, messageStore, cfg.MediaDownloadDir},
 			Sender: waSender{client},
+			Login:  newLoginFlow(state, waPairer{client}, cfg.PublicURL),
 		}
 		http.Handle("/bridge/v1/", http.StripPrefix("/bridge/v1", newContractMux(deps)))
+		// The QR link's token is itself the secret, so these three ride the
+		// outer default mux without the bearer gate; Go's ServeMux picks the
+		// more specific pattern over the "/bridge/v1/" catch-all above.
+		http.HandleFunc("GET /bridge/v1/qr/{token}", deps.Login.QRPage)
+		http.HandleFunc("GET /bridge/v1/qr/{token}/png", deps.Login.QRPNG)
+		http.HandleFunc("GET /bridge/v1/qr/{token}/status", deps.Login.QRStatus)
 	}
 
 	serverAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
@@ -2644,6 +2657,7 @@ func main() {
 				case "code":
 					fmt.Println("\nScan this QR code with your WhatsApp app:")
 					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+					state.SetPairingQRCode(evt.Code)
 					if png, err := qrcode.Encode(evt.Code, qrcode.Medium, 256); err == nil {
 						state.SetPairingQRPNG(png)
 					} else {
@@ -2651,6 +2665,7 @@ func main() {
 					}
 				case "success":
 					fmt.Println("\nSuccessfully connected and authenticated!")
+					state.ClearPairingQR()
 					return
 				case "timeout":
 					logger.Errorf("Pairing QR timeout")

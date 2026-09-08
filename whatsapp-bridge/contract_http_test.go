@@ -60,8 +60,16 @@ func newContractServer(t *testing.T, setup ...func(*MessageStore)) (*httptest.Se
 	cfg := &config.Config{MindetBridgeToken: testToken, MediaSharedRoot: root, MediaDownloadDir: root + "/whatsapp"}
 	deps := &contractDeps{
 		Store: s, State: st, Cfg: cfg, OwnerJID: func() string { return "77000000009@s.whatsapp.net" },
+		Login: newLoginFlow(st, &fakePairer{}, "https://wa.example"),
 	}
-	srv := httptest.NewServer(http.StripPrefix("/bridge/v1", newContractMux(deps)))
+	// Mirrors main.go's wiring: the qr/{token} pages sit on the outer mux,
+	// unauthenticated, alongside the bearer-gated /bridge/v1/ mux.
+	outer := http.NewServeMux()
+	outer.Handle("/bridge/v1/", http.StripPrefix("/bridge/v1", newContractMux(deps)))
+	outer.HandleFunc("GET /bridge/v1/qr/{token}", deps.Login.QRPage)
+	outer.HandleFunc("GET /bridge/v1/qr/{token}/png", deps.Login.QRPNG)
+	outer.HandleFunc("GET /bridge/v1/qr/{token}/status", deps.Login.QRStatus)
+	srv := httptest.NewServer(outer)
 	contractDepsMu.Lock()
 	contractDepsBySrv[srv] = deps
 	contractDepsMu.Unlock()
@@ -128,6 +136,27 @@ func TestBearerGate(t *testing.T) {
 	}
 	if r, _ := get(t, srv.URL+"/bridge/v1/health", testToken); r.StatusCode != 200 {
 		t.Fatalf("right bearer: %d", r.StatusCode)
+	}
+}
+
+// The QR link's token is the secret; a bearer is neither required nor
+// checked. This route must never answer 401.
+func TestQRRouteBypassesTheBearerGate(t *testing.T) {
+	srv, _, st := newContractServer(t)
+	st.SetLoggedIn(false)
+	_, body := post(t, srv.URL+"/bridge/v1/login", testToken, `{}`)
+	challenge, _ := body["challenge"].(map[string]any)
+	if challenge == nil {
+		t.Fatalf("expected a challenge with no bearer needed for qr routes yet: %+v", body)
+	}
+	if r, _ := get(t, srv.URL+"/bridge/v1/qr/not-a-real-token", ""); r.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("qr page must not require a bearer, got %d", r.StatusCode)
+	}
+	if r, _ := get(t, srv.URL+"/bridge/v1/qr/not-a-real-token/png", ""); r.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("qr png must not require a bearer, got %d", r.StatusCode)
+	}
+	if r, _ := get(t, srv.URL+"/bridge/v1/qr/not-a-real-token/status", ""); r.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("qr status must not require a bearer, got %d", r.StatusCode)
 	}
 }
 
