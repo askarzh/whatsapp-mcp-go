@@ -1516,10 +1516,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					} else if isFromMe {
 						sender = client.Store.ID.User
 					} else {
-						sender = jid.User
+						sender = senderKeyOf(jid)
 					}
 				} else {
-					sender = jid.User
+					sender = senderKeyOf(jid)
 				}
 
 				msgID := ""

@@ -145,8 +145,14 @@ func backfillArrival(db *sql.DB) error {
 	}
 	started := time.Now()
 	// done is carried across batches: each batch numbers its own rows from 1,
-	// and the offset keeps the whole run one continuous sequence.
+	// and the offset keeps the whole run one continuous sequence. It starts
+	// from what an earlier, interrupted run already handed out, so a resumed
+	// backfill never re-issues a sequence (a duplicate at a page boundary
+	// would hide a message from the cursor for good).
 	var done int64
+	if err := db.QueryRow(`SELECT coalesce(max(arrival_seq), 0) FROM messages`).Scan(&done); err != nil {
+		return fmt.Errorf("backfill arrival: reading the last sequence: %v", err)
+	}
 	for {
 		res, err := db.Exec(fmt.Sprintf(`UPDATE messages m
 			SET arrival_seq = s.rn + %s, arrived_at_unix = EXTRACT(EPOCH FROM m.timestamp)::bigint

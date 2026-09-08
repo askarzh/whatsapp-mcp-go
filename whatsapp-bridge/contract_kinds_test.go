@@ -104,6 +104,12 @@ func TestStoredSenderKeepsTheLidSuffix(t *testing.T) {
 	if got := storedSender(info, types.JID{}); got != "1839000000000000@lid" {
 		t.Fatalf("empty resolution must fall back to the delivered sender, got %q", got)
 	}
+	// A peer writing from WhatsApp Desktop arrives with a device suffix; the
+	// person is the same, so the stored id must not carry the device.
+	desktop := types.JID{User: "1839000000000000", Device: 23, Server: types.HiddenUserServer}
+	if got := senderKeyOf(desktop); got != "1839000000000000@lid" {
+		t.Fatalf("device suffix leaked into the stored sender: %q", got)
+	}
 	// and the round trip: what we store is what authorOf refuses to key
 	if a := authorOf(storedSender(info, lid), false, ""); a.Key != nil {
 		t.Fatalf("stored lid sender got a key: %+v", a)

@@ -43,7 +43,9 @@ func resolveSenderPN(ctx context.Context, lids store.LIDStore, info types.Messag
 // rewrites both forms once the mapping is learned.
 func senderKeyOf(jid types.JID) string {
 	if jid.Server == types.HiddenUserServer {
-		return jid.String()
+		// The device suffix (":23") varies per client the peer uses; the
+		// person does not. Drop it so one linked id names one sender.
+		return jid.ToNonAD().String()
 	}
 	return jid.User
 }
