@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -152,6 +153,26 @@ func LoadConfig() (*Config, error) {
 		mediaDirs = strings.Split(v, ":")
 	} else if mediaDownloadDir == "store" {
 		mediaDirs = []string{"store", os.TempDir()}
+	}
+
+	// The contract's file paths are MediaDownloadDir-relative-to-MediaSharedRoot
+	// (spec §3.8): if the download dir isn't inside the shared root, every
+	// files[].path the bridge would hand Mindet is wrong. The bare /api path
+	// has no such requirement, so this only bites when the contract is on.
+	if mindetToken != "" {
+		absDownload, err := filepath.Abs(mediaDownloadDir)
+		if err != nil {
+			return nil, fmt.Errorf("resolving MEDIA_DOWNLOAD_DIR %q: %w", mediaDownloadDir, err)
+		}
+		absShared, err := filepath.Abs(sharedRoot)
+		if err != nil {
+			return nil, fmt.Errorf("resolving MEDIA_SHARED_ROOT %q: %w", sharedRoot, err)
+		}
+		rel, err := filepath.Rel(absShared, absDownload)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf("MEDIA_DOWNLOAD_DIR (%s) must be inside MEDIA_SHARED_ROOT (%s) when MINDET_BRIDGE_TOKEN is set, "+
+				"so /bridge/v1 file paths resolve for Mindet", mediaDownloadDir, sharedRoot)
+		}
 	}
 
 	return &Config{

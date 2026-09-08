@@ -33,10 +33,23 @@ services:
       WEBHOOK_URL: "${WEBHOOK_URL:-}"
       HOST: "${HOST:-}"
       PORT: "${PORT:-8080}"
+      # Mindet's own bearer for /bridge/v1 (platform spec §6); unset disables
+      # the contract surface. ≥32 chars: openssl rand -base64 48
+      MINDET_BRIDGE_TOKEN: "${MINDET_BRIDGE_TOKEN:-}"
+      # files[].path on the contract are relative to this root; the bridge's
+      # MEDIA_DOWNLOAD_DIR must be inside it.
+      MEDIA_SHARED_ROOT: "${MEDIA_SHARED_ROOT:-/shared}"
+      MEDIA_DOWNLOAD_DIR: "${MEDIA_DOWNLOAD_DIR:-/shared/whatsapp}"
+      # Where the QR-link page is reachable from the owner's browser. Compose
+      # cannot express "required only if MINDET_BRIDGE_TOKEN is set", so this
+      # keeps a localhost default — see the README's "bridge contract"
+      # section for when you must override it.
+      BRIDGE_PUBLIC_URL: "${BRIDGE_PUBLIC_URL:-http://localhost:8080}"
     ports:
       - "8080:8080"
     volumes:
       - bridge-store:/project/store
+      - shared:/shared
     depends_on:
       - postgres
     deploy:
@@ -62,6 +75,8 @@ services:
       LOG_LEVEL: "${LOG_LEVEL:-info}"
     ports:
       - "5777:5777"
+    volumes:
+      - shared:/shared
     depends_on:
       - wa-bridge
     deploy:
@@ -76,3 +91,4 @@ services:
 volumes:
   pgdata:
   bridge-store:
+  shared:
