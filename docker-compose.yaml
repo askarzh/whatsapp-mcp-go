@@ -43,10 +43,9 @@ services:
       # MEDIA_DOWNLOAD_DIR must be inside it.
       MEDIA_SHARED_ROOT: "${MEDIA_SHARED_ROOT:-/shared}"
       MEDIA_DOWNLOAD_DIR: "${MEDIA_DOWNLOAD_DIR:-/shared/whatsapp}"
-      # Where the QR-link page is reachable from the owner's browser. Compose
-      # cannot express "required only if MINDET_BRIDGE_TOKEN is set", so this
-      # keeps a localhost default — see the README's "bridge contract"
-      # section for when you must override it.
+      # Where the QR-link page is reachable from the owner's browser. The
+      # bridge refuses to start when MINDET_BRIDGE_TOKEN is set and this is
+      # unset or still localhost: the login link would open nowhere.
       BRIDGE_PUBLIC_URL: "${BRIDGE_PUBLIC_URL:-http://localhost:8080}"
     ports:
       - "8080:8080"

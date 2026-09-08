@@ -168,6 +168,7 @@ func TestMindetBridgeToken(t *testing.T) {
 
 	t.Run("valid token passes through and defaults apply", func(t *testing.T) {
 		t.Setenv("MINDET_BRIDGE_TOKEN", strings.Repeat("t", 32))
+		t.Setenv("BRIDGE_PUBLIC_URL", "https://wa.example")
 		// The default MediaDownloadDir ("store", relative to the working
 		// directory) is not inside the default MediaSharedRoot ("/shared"),
 		// so with the token on this needs an explicit download dir that is.
@@ -182,8 +183,64 @@ func TestMindetBridgeToken(t *testing.T) {
 		if cfg.MediaSharedRoot != "/shared" {
 			t.Errorf("MediaSharedRoot = %q, want /shared", cfg.MediaSharedRoot)
 		}
+		if cfg.PublicURL != "https://wa.example" {
+			t.Errorf("PublicURL = %q, want https://wa.example", cfg.PublicURL)
+		}
+	})
+
+	t.Run("no token still defaults the public URL to localhost", func(t *testing.T) {
+		t.Setenv("MINDET_BRIDGE_TOKEN", "")
+		t.Setenv("BRIDGE_PUBLIC_URL", "")
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
 		if cfg.PublicURL != "http://localhost:8080" {
 			t.Errorf("PublicURL = %q, want http://localhost:8080", cfg.PublicURL)
+		}
+	})
+}
+
+// The login QR link is built from BRIDGE_PUBLIC_URL. Left at its localhost
+// default it resolves only inside the container, so the owner gets a link
+// that cannot open — and the only way to pair from chat is that link.
+func TestPublicURLIsRequiredWhenTheContractIsOn(t *testing.T) {
+	t.Setenv("WHATSAPP_API_KEY", strings.Repeat("k", 32))
+	t.Setenv("WHATSAPP_JWT_SECRET", strings.Repeat("j", 32))
+	t.Setenv("MEDIA_DOWNLOAD_DIR", "/shared/whatsapp")
+
+	t.Run("unset with the token set fails", func(t *testing.T) {
+		t.Setenv("MINDET_BRIDGE_TOKEN", strings.Repeat("t", 32))
+		t.Setenv("BRIDGE_PUBLIC_URL", "")
+		_, err := LoadConfig()
+		if err == nil || !strings.Contains(err.Error(), "BRIDGE_PUBLIC_URL") {
+			t.Fatalf("LoadConfig error = %v, want it to name BRIDGE_PUBLIC_URL", err)
+		}
+	})
+
+	t.Run("still localhost with the token set fails", func(t *testing.T) {
+		t.Setenv("MINDET_BRIDGE_TOKEN", strings.Repeat("t", 32))
+		for _, u := range []string{"http://localhost:8080", "http://127.0.0.1:8080"} {
+			t.Setenv("BRIDGE_PUBLIC_URL", u)
+			if _, err := LoadConfig(); err == nil {
+				t.Fatalf("LoadConfig accepted %q", u)
+			}
+		}
+	})
+
+	t.Run("a reachable URL with the token set passes", func(t *testing.T) {
+		t.Setenv("MINDET_BRIDGE_TOKEN", strings.Repeat("t", 32))
+		t.Setenv("BRIDGE_PUBLIC_URL", "https://wa.example.test")
+		if _, err := LoadConfig(); err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+	})
+
+	t.Run("without the token localhost is fine", func(t *testing.T) {
+		t.Setenv("MINDET_BRIDGE_TOKEN", "")
+		t.Setenv("BRIDGE_PUBLIC_URL", "http://localhost:8080")
+		if _, err := LoadConfig(); err != nil {
+			t.Fatalf("LoadConfig: %v", err)
 		}
 	})
 }
@@ -196,6 +253,7 @@ func TestMindetBridgeToken(t *testing.T) {
 func TestMediaDownloadDirMustBeInsideSharedRootWhenContractIsOn(t *testing.T) {
 	t.Setenv("WHATSAPP_API_KEY", strings.Repeat("k", 32))
 	t.Setenv("WHATSAPP_JWT_SECRET", strings.Repeat("j", 32))
+	t.Setenv("BRIDGE_PUBLIC_URL", "https://wa.example.test")
 
 	t.Run("outside the shared root with the token set fails", func(t *testing.T) {
 		t.Setenv("MINDET_BRIDGE_TOKEN", strings.Repeat("t", 32))

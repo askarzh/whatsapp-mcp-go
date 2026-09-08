@@ -208,12 +208,35 @@ after ten minutes, so no bearer is needed or checked on that route.
 
 ### Deploying with Mindet
 
-`BRIDGE_PUBLIC_URL` has no safe default once `MINDET_BRIDGE_TOKEN` is set —
-docker-compose can't express "required only if X is set", so the bundled
-`docker-compose.yaml` keeps a `localhost` default and this note is the
-enforcement: **whenever `MINDET_BRIDGE_TOKEN` is set, also set
-`BRIDGE_PUBLIC_URL`** to the URL the owner's browser can actually reach, or
-the QR-link the daemon relays will point nowhere useful.
+`BRIDGE_PUBLIC_URL` has no safe default once `MINDET_BRIDGE_TOKEN` is set:
+the login QR link the daemon relays to the owner is built from it, and a
+`localhost` URL only resolves inside the container. Startup now refuses that
+combination — with the token set, `BRIDGE_PUBLIC_URL` must be present and
+must not be `localhost`/`127.0.0.1` — so a dead login link cannot ship
+quietly. (docker-compose can't express "required only if X is set", so the
+bundled `docker-compose.yaml` still carries a localhost default; the bridge
+is the enforcement.)
+
+**Before the first start against a real mirror**, check how much there is to
+migrate:
+
+```sql
+SELECT count(*) FROM messages WHERE arrival_seq IS NULL;
+```
+
+The first start of this version gives every existing row an arrival order,
+in batches of 50 000, and does not answer HTTP — `/api` included — until it
+finishes; it logs the row count before it starts and the elapsed time as it
+goes. Expect the first start to take proportionally longer on a mirror with
+years of history, and read the log rather than assuming the container hung.
+Later starts skip it entirely (the column is only filled where it is NULL).
+
+Media already downloaded under the old private `store/` path would be
+reported `pending` forever once `MEDIA_DOWNLOAD_DIR` moves, since the bridge
+looks for the file under the new dir. The owner's stack already downloads to
+`/shared/whatsapp`, which is exactly the value this compose file defaults to,
+so nothing is orphaned there; on any other deployment, move or symlink the
+old directory before the first start.
 
 For the owner's own stack (`/home/askar/stack/compose/personal.yml`, not in
 this repository — an operator step, not a code change), add to
@@ -240,6 +263,11 @@ against this one. Four of its nine tests seed a store directly and are
 skipped against a real bridge (they are seeding tests; `TestEndToEndArrivalOrderEditsAndMedia`
 in `whatsapp-bridge/contract_e2e_test.go` covers the same ground as a Go
 test against a real store instead). Run:
+
+The bridge under test needs `BRIDGE_PUBLIC_URL` set to something that is not
+localhost (it is only ever used to build the login QR link, so any hostname
+the owner could reach will do); the suite itself still talks to it on
+whatever address you give `MINDET_CONTRACT_URL`.
 
 ```bash
 cd /home/askar/src/mindet

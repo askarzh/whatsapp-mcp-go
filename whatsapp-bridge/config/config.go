@@ -159,6 +159,27 @@ func LoadConfig() (*Config, error) {
 		mediaDirs = []string{"store", os.TempDir()}
 	}
 
+	// The QR link the login flow hands the owner is built from PublicURL. A
+	// localhost default is a link that works only from inside the container,
+	// so with the contract on it is a dead end by construction — the same
+	// shape of coupling as the media dirs below, and worth the same refusal.
+	if mindetToken != "" {
+		raw := os.Getenv("BRIDGE_PUBLIC_URL")
+		if raw == "" {
+			return nil, fmt.Errorf("BRIDGE_PUBLIC_URL must be set when MINDET_BRIDGE_TOKEN is set, " +
+				"to the URL the owner's browser can reach this bridge at: the login QR link is built from it")
+		}
+		host := raw
+		if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
+			host = u.Hostname()
+		}
+		switch host {
+		case "localhost", "127.0.0.1", "::1", "0.0.0.0":
+			return nil, fmt.Errorf("BRIDGE_PUBLIC_URL is still %q; with MINDET_BRIDGE_TOKEN set it must be a URL "+
+				"the owner's browser can reach, or the login QR link the daemon relays points nowhere", raw)
+		}
+	}
+
 	// The contract's file paths are MediaDownloadDir-relative-to-MediaSharedRoot
 	// (spec §3.8): if the download dir isn't inside the shared root, every
 	// files[].path the bridge would hand Mindet is wrong. The bare /api path

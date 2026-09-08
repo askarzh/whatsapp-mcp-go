@@ -62,10 +62,21 @@ func ensureContractColumns(db *sql.DB) error {
 		placeholder(1)), hex.EncodeToString(gen)); err != nil {
 		return err
 	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS ix_messages_arrival ON messages (arrival_seq)`); err != nil {
+	if err := backfillArrival(db); err != nil {
 		return err
 	}
-	return backfillArrival(db)
+	// After the backfill, not before: there is no point maintaining an index
+	// through a rewrite of every row. CONCURRENTLY keeps the build from
+	// taking a lock that blocks writes on a table this bridge is about to
+	// serve from.
+	create := `CREATE INDEX IF NOT EXISTS ix_messages_arrival ON messages (arrival_seq)`
+	if isPostgres {
+		create = `CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_messages_arrival ON messages (arrival_seq)`
+	}
+	if _, err := db.Exec(create); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Generation identifies this store, for the lifetime of its data. Read once
@@ -88,7 +99,10 @@ func (store *MessageStore) Generation() string {
 func hasColumn(db *sql.DB, table, column string) bool {
 	var q string
 	if isPostgres {
-		q = fmt.Sprintf(`SELECT 1 FROM information_schema.columns WHERE table_name=%s AND column_name=%s`,
+		// current_schema(): a messages table in another schema on the same
+		// database must not answer for ours.
+		q = fmt.Sprintf(`SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name=%s AND column_name=%s`,
 			placeholder(1), placeholder(2))
 	} else {
 		q = `SELECT 1 FROM pragma_table_info(?) WHERE name = ?`
@@ -99,27 +113,65 @@ func hasColumn(db *sql.DB, table, column string) bool {
 
 // Rows written before the columns existed get an arrival order that follows
 // their WhatsApp time: the best guess there is, and a stable one.
+//
+// This runs at startup, before the HTTP server answers anything, over every
+// row of a table that on the owner's own mirror holds years of WhatsApp. One
+// UPDATE across all of it would be a single long transaction, a table-sized
+// bloat until autovacuum, and a bridge that is simply down for the duration
+// with nothing saying why. So Postgres does it in batches, says how many
+// rows it has to touch before it starts, and says how long it took.
+const backfillBatch = 50000
+
 func backfillArrival(db *sql.DB) error {
-	var q string
-	if isPostgres {
-		q = `UPDATE messages m SET arrival_seq = s.rn, arrived_at_unix = EXTRACT(EPOCH FROM m.timestamp)::bigint
-		     FROM (SELECT id, chat_jid, row_number() OVER (ORDER BY timestamp, id) AS rn FROM messages WHERE arrival_seq IS NULL) s
-		     WHERE m.id = s.id AND m.chat_jid = s.chat_jid`
-	} else {
-		q = `UPDATE messages SET
+	if !isPostgres {
+		q := `UPDATE messages SET
 		       arrival_seq = (SELECT rn FROM (SELECT id, chat_jid, row_number() OVER (ORDER BY timestamp, id) AS rn FROM messages WHERE arrival_seq IS NULL) s
 		                      WHERE s.id = messages.id AND s.chat_jid = messages.chat_jid),
 		       arrived_at_unix = CAST(strftime('%s', timestamp) AS INTEGER)
 		     WHERE arrival_seq IS NULL`
+		if _, err := db.Exec(q); err != nil {
+			return fmt.Errorf("backfill arrival: %v", err)
+		}
+		return nil
 	}
-	if _, err := db.Exec(q); err != nil {
-		return fmt.Errorf("backfill arrival: %v", err)
+
+	var pending int64
+	if err := db.QueryRow(`SELECT count(*) FROM messages WHERE arrival_seq IS NULL`).Scan(&pending); err != nil {
+		return fmt.Errorf("backfill arrival: counting rows: %v", err)
 	}
-	if isPostgres {
-		_, err := db.Exec(`SELECT setval('messages_arrival_seq', coalesce((SELECT max(arrival_seq) FROM messages), 0) + 1, false)`)
-		return err
+	if pending > 0 {
+		slog.Info("contract: giving existing messages an arrival order; the bridge does not answer until this finishes",
+			"rows", pending, "batch", backfillBatch)
 	}
-	return nil
+	started := time.Now()
+	// done is carried across batches: each batch numbers its own rows from 1,
+	// and the offset keeps the whole run one continuous sequence.
+	var done int64
+	for {
+		res, err := db.Exec(fmt.Sprintf(`UPDATE messages m
+			SET arrival_seq = s.rn + %s, arrived_at_unix = EXTRACT(EPOCH FROM m.timestamp)::bigint
+			FROM (SELECT id, chat_jid, row_number() OVER (ORDER BY timestamp, id) AS rn FROM messages
+			      WHERE (id, chat_jid) IN (
+			          SELECT id, chat_jid FROM messages WHERE arrival_seq IS NULL ORDER BY timestamp, id LIMIT %d)) s
+			WHERE m.id = s.id AND m.chat_jid = s.chat_jid`, placeholder(1), backfillBatch), done)
+		if err != nil {
+			return fmt.Errorf("backfill arrival: %v", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("backfill arrival: %v", err)
+		}
+		if n == 0 {
+			break
+		}
+		done += n
+		slog.Info("contract: arrival backfill progress", "done", done, "of", pending, "elapsed", time.Since(started).String())
+	}
+	if done > 0 {
+		slog.Info("contract: arrival backfill complete", "rows", done, "elapsed", time.Since(started).String())
+	}
+	_, err := db.Exec(`SELECT setval('messages_arrival_seq', coalesce((SELECT max(arrival_seq) FROM messages), 0) + 1, false)`)
+	return err
 }
 
 // nextArrivalSQL is the expression that allocates the next arrival sequence
