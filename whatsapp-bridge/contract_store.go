@@ -227,7 +227,12 @@ func (store *MessageStore) StoreMessageKind(id, chatJID, sender, content string,
 	// might be the directive.
 	storeMu.Lock()
 	defer storeMu.Unlock()
-	_, err := store.db.Exec(q, id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url,
+	// timestamp.UTC(): the column has no zone, so what lands in it is the
+	// wall clock of whatever zone the time carries. whatsmeow hands us a
+	// local time; a bridge running in the owner's own zone would write
+	// 10:06 for an instant it then reports as 05:06Z. Convert once, here,
+	// where the row is written.
+	_, err := store.db.Exec(q, id, chatJID, sender, content, timestamp.UTC(), isFromMe, mediaType, filename, url,
 		mediaKey, fileSHA256, fileEncSHA256, fileLength, kind, edits, now)
 	return err
 }

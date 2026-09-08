@@ -210,3 +210,32 @@ func TestConcurrentStoresGetDistinctArrivalSequences(t *testing.T) {
 		t.Fatalf("paging handed out %d of %d messages", walked, n)
 	}
 }
+
+// The timestamp column has no zone: what gets stored is the wall clock of
+// whatever zone the time carries. whatsmeow hands the bridge a local time,
+// so a bridge running in the owner's own zone would store 10:06 for an
+// instant the contract then reports as 05:06Z — five hours of drift, no
+// error anywhere, and arrived_at (a real epoch) silently disagreeing with
+// sent_at on the same row.
+func TestStoredTimesKeepTheirInstantWhateverTheZone(t *testing.T) {
+	s := newTestMessageStore(t)
+	mustExec(t, s.db, `INSERT INTO chats (jid, name) VALUES ('c@s.whatsapp.net', 'x')`)
+	zone := time.FixedZone("+05", 5*60*60)
+	instant := time.Date(2026, 9, 8, 5, 6, 7, 0, time.UTC)
+	if err := s.StoreMessage("tz", "c@s.whatsapp.net", "c", "hi", instant.In(zone), false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.ListArrived(0, time.Time{}, 1)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("list: %+v %v", rows, err)
+	}
+	if !rows[0].Timestamp.Equal(instant) {
+		t.Fatalf("read back %s, want the same instant as %s", rows[0].Timestamp, instant)
+	}
+	if rows[0].Timestamp.Location() != time.UTC {
+		t.Fatalf("the contract labels every time UTC; got %s", rows[0].Timestamp.Location())
+	}
+	if got := fmtTime(rows[0].Timestamp); got != "2026-09-08T05:06:07.000000+00:00" {
+		t.Fatalf("on the wire: %s", got)
+	}
+}
