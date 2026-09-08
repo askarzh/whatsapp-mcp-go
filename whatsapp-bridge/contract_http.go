@@ -2,10 +2,12 @@ package main
 
 import (
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,9 +18,20 @@ import (
 
 const contractVersion = 1
 
-type mediaFetcher interface{}  // Task 4
-type messageSender interface{} // Task 4
-type loginFlow struct{}        // Task 5
+var (
+	errMediaGone    = errors.New("media gone upstream")
+	errMediaUnknown = errors.New("unknown message")
+)
+
+type mediaFetcher interface {
+	Fetch(messageID, chatJID string) (absPath string, err error)
+}
+
+type messageSender interface {
+	Send(chat, text, mediaAbsPath string) (nativeID string, sentAt time.Time, err error)
+}
+
+type loginFlow struct{} // Task 5
 
 type contractDeps struct {
 	Store    *MessageStore
@@ -66,8 +79,10 @@ func newContractMux(d *contractDeps) http.Handler {
 	mux.HandleFunc("GET /messages", d.messages)
 	mux.HandleFunc("GET /chats", d.chats)
 	mux.HandleFunc("GET /contacts", d.contacts)
-	// Task 4 adds: GET /media/{id}, POST /send. Task 5 adds POST /login and
-	// the unauthenticated /qr/{token} pages on the outer mux.
+	mux.HandleFunc("GET /media/{id}", d.media)
+	mux.HandleFunc("POST /send", d.send)
+	// Task 5 adds POST /login and the unauthenticated /qr/{token} pages on
+	// the outer mux.
 	return bearerGate(d.Cfg.MindetBridgeToken, mux)
 }
 
@@ -194,4 +209,96 @@ func (d *contractDeps) contacts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"contacts": list})
+}
+
+// media reports where a message's file lives, relative to MediaSharedRoot —
+// Mindet's daemon and this bridge both mount that root, so a relative path is
+// all either side needs. Repeating the request is safe: Fetch downloads at
+// most once and every later call finds the same file already on disk.
+func (d *contractDeps) media(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	chat := r.URL.Query().Get("chat")
+	if id == "" || chat == "" {
+		writeErr(w, 400, "id and chat are required")
+		return
+	}
+	m, err := d.Store.LookupMessage(id, chat)
+	if err != nil {
+		writeErr(w, 500, "store error")
+		return
+	}
+	if m == nil {
+		writeErr(w, 404, "unknown message")
+		return
+	}
+	abs, err := d.Media.Fetch(id, chat)
+	switch {
+	case errors.Is(err, errMediaUnknown):
+		writeErr(w, 404, "unknown message")
+		return
+	case errors.Is(err, errMediaGone):
+		writeErr(w, 410, "upstream media expired")
+		return
+	case err != nil:
+		slog.Warn("contract media", "id", id, "err", err)
+		writeErr(w, 500, "download failed")
+		return
+	}
+	rel, err := filepath.Rel(d.Cfg.MediaSharedRoot, abs)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		writeErr(w, 500, "media is outside the shared root")
+		return
+	}
+	var sha *string
+	if len(m.FileSHA256) > 0 {
+		h := hex.EncodeToString(m.FileSHA256)
+		sha = &h
+	}
+	writeJSON(w, 200, map[string]any{"path": filepath.ToSlash(rel), "mime": mimeFor(m.MediaType, m.Filename), "sha256": sha})
+}
+
+type sendRequest struct {
+	IdempotencyKey string `json:"idempotency_key"`
+	To             struct {
+		Chat string `json:"chat"`
+	} `json:"to"`
+	Text  string   `json:"text"`
+	Files []string `json:"files"`
+}
+
+// send is idempotent on the caller's key (spec §3.6): the key is remembered
+// before the reply is written, so a crash between the send and the reply
+// still leaves one message, not two, and a retried request after a lost
+// reply answers from memory instead of sending the boss the same text twice.
+// One file per send in v1; a second file is a second send.
+func (d *contractDeps) send(w http.ResponseWriter, r *http.Request) {
+	var req sendRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.IdempotencyKey == "" || req.To.Chat == "" {
+		writeErr(w, 400, "idempotency_key, to.chat required")
+		return
+	}
+	if id, at, ok, err := d.Store.RecallSend(req.IdempotencyKey); err != nil {
+		writeErr(w, 500, "store error")
+		return
+	} else if ok {
+		writeJSON(w, 200, map[string]any{"native_id": id, "sent_at": fmtTime(at)})
+		return
+	}
+	media := ""
+	if len(req.Files) > 0 {
+		media = filepath.Join(d.Cfg.MediaSharedRoot, filepath.FromSlash(req.Files[0]))
+		if err := allowedMediaPath(d.Cfg.MediaDirs, media); err != nil {
+			writeErr(w, 400, "file is outside the allowed directories: "+err.Error())
+			return
+		}
+	}
+	id, at, err := d.Sender.Send(req.To.Chat, req.Text, media)
+	if err != nil {
+		writeErr(w, 502, err.Error())
+		return
+	}
+	if err := d.Store.RememberSend(req.IdempotencyKey, id, at); err != nil {
+		slog.Error("remember send", "err", err)
+	}
+	writeJSON(w, 200, map[string]any{"native_id": id, "sent_at": fmtTime(at)})
 }

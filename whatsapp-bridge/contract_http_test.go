@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -29,6 +33,16 @@ func contractDepsOf(srv *httptest.Server) *contractDeps {
 	return contractDepsBySrv[srv]
 }
 
+// setMedia and setSender let a test swap in a fake after the mux already
+// closed over the *contractDeps pointer.
+func setMedia(srv *httptest.Server, m mediaFetcher) {
+	contractDepsOf(srv).Media = m
+}
+
+func setSender(srv *httptest.Server, s messageSender) {
+	contractDepsOf(srv).Sender = s
+}
+
 // setup runs against the store before the mux is built, so a test that needs
 // whatsmeow's tables in place for the contacts-availability probe (run once,
 // at mux construction) can create them in time.
@@ -41,7 +55,8 @@ func newContractServer(t *testing.T, setup ...func(*MessageStore)) (*httptest.Se
 	st := wastate.New()
 	st.SetConnected(true)
 	st.SetLoggedIn(true)
-	cfg := &config.Config{MindetBridgeToken: testToken, MediaSharedRoot: t.TempDir(), MediaDownloadDir: t.TempDir() + "/whatsapp"}
+	root := t.TempDir()
+	cfg := &config.Config{MindetBridgeToken: testToken, MediaSharedRoot: root, MediaDownloadDir: root + "/whatsapp"}
 	deps := &contractDeps{
 		Store: s, State: st, Cfg: cfg, OwnerJID: func() string { return "77000000009@s.whatsapp.net" },
 	}
@@ -72,6 +87,34 @@ func get(t *testing.T, url, token string) (*http.Response, map[string]any) {
 	var body map[string]any
 	_ = json.NewDecoder(resp.Body).Decode(&body)
 	return resp, body
+}
+
+func post(t *testing.T, url, token, body string) (*http.Response, map[string]any) {
+	t.Helper()
+	req, _ := http.NewRequest("POST", url, bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return resp, out
+}
+
+// mustWriteT is mustWrite without the *testing.T — usable from a fake that
+// has no test handle of its own.
+func mustWriteT(path string) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		panic(err)
+	}
 }
 
 func TestBearerGate(t *testing.T) {
@@ -219,5 +262,72 @@ func TestContactsUnavailable(t *testing.T) {
 	r, body := get(t, srv.URL+"/bridge/v1/contacts", testToken)
 	if r.StatusCode != http.StatusNotFound || body["error"] != "contacts not available" {
 		t.Fatalf("contacts without the table: %d %+v", r.StatusCode, body)
+	}
+}
+
+type fakeMedia struct {
+	calls int
+	gone  bool
+	dir   string
+}
+
+func (f *fakeMedia) Fetch(id, chat string) (string, error) {
+	f.calls++
+	if id == "unknown" {
+		return "", errMediaUnknown
+	}
+	if f.gone {
+		return "", errMediaGone
+	}
+	p := f.dir + "/" + chat + "/" + id + ".ogg"
+	mustWriteT(p)
+	return p, nil
+}
+
+type fakeSender struct{ sent []string }
+
+func (f *fakeSender) Send(chat, text, media string) (string, time.Time, error) {
+	f.sent = append(f.sent, chat+":"+text)
+	return fmt.Sprintf("SENT%d", len(f.sent)), time.Date(2026, 9, 8, 9, 0, 0, 0, time.UTC), nil
+}
+
+func TestMediaIsIdempotentGoneIs410UnknownIs404AndIdIsPercentDecoded(t *testing.T) {
+	srv, s, _ := newContractServer(t)
+	fm := &fakeMedia{dir: contractDepsOf(srv).Cfg.MediaDownloadDir}
+	setMedia(srv, fm)
+	mustExec(t, s.db, `INSERT INTO chats (jid, name) VALUES ('c@s.whatsapp.net', 'x')`)
+	_ = s.StoreMessage("v/1+", "c@s.whatsapp.net", "c", "", time.Now().UTC(), false, "audio", "v1.ogg", "u", []byte{1}, []byte{2}, []byte{3}, 4)
+	r1, a := get(t, srv.URL+"/bridge/v1/media/v%2F1%2B?chat=c@s.whatsapp.net", testToken)
+	r2, b := get(t, srv.URL+"/bridge/v1/media/v%2F1%2B?chat=c@s.whatsapp.net", testToken)
+	if r1.StatusCode != 200 || r2.StatusCode != 200 || a["path"] != b["path"] || a["path"] != "whatsapp/c@s.whatsapp.net/v/1+.ogg" {
+		t.Fatalf("%d %d %+v %+v", r1.StatusCode, r2.StatusCode, a, b)
+	}
+	if a["sha256"] != "02" || a["mime"] != "audio/ogg" {
+		t.Fatalf("media info: %+v", a)
+	}
+	fm.gone = true
+	if r, _ := get(t, srv.URL+"/bridge/v1/media/v%2F1%2B?chat=c@s.whatsapp.net", testToken); r.StatusCode != 410 {
+		t.Fatalf("gone must be 410, got %d", r.StatusCode)
+	}
+	if r, _ := get(t, srv.URL+"/bridge/v1/media/unknown?chat=c@s.whatsapp.net", testToken); r.StatusCode != 404 {
+		t.Fatalf("unknown must be 404, got %d", r.StatusCode)
+	}
+}
+
+func TestSendIsIdempotentOnKey(t *testing.T) {
+	srv, _, _ := newContractServer(t)
+	fs := &fakeSender{}
+	setSender(srv, fs)
+	body := `{"idempotency_key":"k1","to":{"chat":"c@s.whatsapp.net"},"text":"hello"}`
+	r1, a := post(t, srv.URL+"/bridge/v1/send", testToken, body)
+	r2, b := post(t, srv.URL+"/bridge/v1/send", testToken, body)
+	if r1.StatusCode != 200 || r2.StatusCode != 200 || a["native_id"] != b["native_id"] || len(fs.sent) != 1 {
+		t.Fatalf("%d %d %+v %+v sent=%v", r1.StatusCode, r2.StatusCode, a, b, fs.sent)
+	}
+	if !strings.HasSuffix(a["sent_at"].(string), "+00:00") {
+		t.Fatalf("sent_at: %v", a["sent_at"])
+	}
+	if r, _ := post(t, srv.URL+"/bridge/v1/send", testToken, `{"to":{"chat":"c"},"text":"x"}`); r.StatusCode != 400 {
+		t.Fatalf("missing key must be 400, got %d", r.StatusCode)
 	}
 }

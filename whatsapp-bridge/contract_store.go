@@ -331,3 +331,26 @@ func (store *MessageStore) ListContactsForContract() ([]contractContact, error) 
 	}
 	return out, lidRows.Err()
 }
+
+// RememberSend and RecallSend back the idempotency key on /bridge/v1/send
+// (spec §3.6): a repeated key must answer from memory rather than send
+// again, so the key is written before the reply goes out.
+func (store *MessageStore) RememberSend(key, nativeID string, sentAt time.Time) error {
+	_, err := store.db.Exec(fmt.Sprintf(`INSERT INTO sent_by_key (idempotency_key, native_id, sent_at_unix) VALUES (%s, %s, %s)
+		ON CONFLICT (idempotency_key) DO NOTHING`, placeholder(1), placeholder(2), placeholder(3)), key, nativeID, sentAt.Unix())
+	return err
+}
+
+func (store *MessageStore) RecallSend(key string) (string, time.Time, bool, error) {
+	var id string
+	var at int64
+	err := store.db.QueryRow(fmt.Sprintf(`SELECT native_id, sent_at_unix FROM sent_by_key WHERE idempotency_key = %s`,
+		placeholder(1)), key).Scan(&id, &at)
+	if err == sql.ErrNoRows {
+		return "", time.Time{}, false, nil
+	}
+	if err != nil {
+		return "", time.Time{}, false, err
+	}
+	return id, time.Unix(at, 0).UTC(), true, nil
+}

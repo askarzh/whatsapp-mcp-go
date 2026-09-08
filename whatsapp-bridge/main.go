@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -297,20 +298,19 @@ func CustomGetLatestVersion(ctx context.Context, httpClient *http.Client) (*stor
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (id string, sentAt time.Time, err error) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return "", time.Time{}, errors.New("not connected to WhatsApp")
 	}
 
 	var recipientJID types.JID
-	var err error
 
 	isJID := strings.Contains(recipient, "@")
 
 	if isJID {
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return "", time.Time{}, fmt.Errorf("error parsing JID: %v", err)
 		}
 	} else {
 		recipientJID = types.JID{
@@ -324,7 +324,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	if mediaPath != "" {
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return "", time.Time{}, fmt.Errorf("error reading media file: %v", err)
 		}
 
 		fileExt := strings.ToLower(mediaPath[strings.LastIndex(mediaPath, ".")+1:])
@@ -366,7 +366,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return "", time.Time{}, fmt.Errorf("error uploading media: %v", err)
 		}
 
 		slog.Info("media uploaded", "response", resp)
@@ -393,7 +393,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return "", time.Time{}, fmt.Errorf("failed to analyze Ogg Opus file: %v", err)
 				}
 			} else {
 				slog.Warn("not an Ogg Opus file", "mime_type", mimeType)
@@ -439,13 +439,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		msg.Conversation = proto.String(message)
 	}
 
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
-
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return "", time.Time{}, fmt.Errorf("error sending message: %v", err)
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	return resp.ID, resp.Timestamp, nil
 }
 
 // Extract media info from a message
@@ -733,7 +732,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		}
 
 		if err != nil {
-			return false, "", "", "", fmt.Errorf("failed to find message: %v", err)
+			return false, "", "", "", fmt.Errorf("%w: %v", errMediaUnknown, err)
 		}
 	}
 
@@ -760,7 +759,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	if url == "" || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
-		return false, "", "", "", fmt.Errorf("incomplete media information for download")
+		return false, "", "", "", fmt.Errorf("%w: no keys stored for this message", errMediaGone)
 	}
 
 	slog.Info("attempting to download media", "message_id", messageID, "chat_jid", chatJID)
@@ -793,6 +792,13 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
+		var httpErr whatsmeow.DownloadHTTPError
+		if errors.As(err, &httpErr) && (httpErr.Response.StatusCode == 403 || httpErr.Response.StatusCode == 404 || httpErr.Response.StatusCode == 410) {
+			return false, "", "", "", fmt.Errorf("%w: cdn %d", errMediaGone, httpErr.Response.StatusCode)
+		}
+		if errors.Is(err, whatsmeow.ErrNoURLPresent) {
+			return false, "", "", "", fmt.Errorf("%w: %v", errMediaGone, err)
+		}
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
 
@@ -817,6 +823,25 @@ func extractDirectPathFromURL(url string) string {
 	// appends "&hash=...&mms-type=...&__wa-mms=" to this path, so WhatsApp's own
 	// ?ccb/oh/oe/_nc_sid params must still be attached or the CDN returns 403.
 	return "/" + parts[1]
+}
+
+// waMedia and waSender adapt the real client and store to the contract's
+// mediaFetcher and messageSender interfaces (contract_http.go).
+type waMedia struct {
+	client *whatsmeow.Client
+	store  *MessageStore
+	dir    string
+}
+
+func (m waMedia) Fetch(id, chat string) (string, error) {
+	_, _, _, abs, err := downloadMedia(m.client, m.store, id, chat, m.dir)
+	return abs, err
+}
+
+type waSender struct{ client *whatsmeow.Client }
+
+func (s waSender) Send(chat, text, media string) (string, time.Time, error) {
+	return sendWhatsAppMessage(s.client, chat, text, media)
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -858,7 +883,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 
 		slog.Info("received request to send message", "message", req.Message, "media_path", req.MediaPath)
 
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		_, _, err := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success := err == nil
+		message := fmt.Sprintf("Message sent to %s", req.Recipient)
+		if err != nil {
+			message = err.Error()
+		}
 		slog.Info("message sent", "success", success, "message", message)
 		w.Header().Set("Content-Type", "application/json")
 
@@ -1272,7 +1302,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 					return ""
 				}
 				return client.Store.ID.ToNonAD().String()
-			}}
+			},
+			Media:  waMedia{client, messageStore, cfg.MediaDownloadDir},
+			Sender: waSender{client},
+		}
 		http.Handle("/bridge/v1/", http.StripPrefix("/bridge/v1", newContractMux(deps)))
 	}
 
