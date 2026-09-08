@@ -138,6 +138,28 @@ func TestToContractMessageShapesFilesAndTimes(t *testing.T) {
 	}
 }
 
+// A media message stored before its filename was known must still show a
+// file: no path, pending true. Reporting no files at all would hide it from
+// Mindet, which would then never ask /media for it.
+func TestMediaWithoutAFilenameIsStillReportedAsPending(t *testing.T) {
+	dir := t.TempDir()
+	m := ArrivedMessage{ID: "v2", ChatJID: "77000000001@s.whatsapp.net", Sender: "77000000001",
+		Timestamp: time.Date(2026, 9, 7, 6, 40, 11, 0, time.UTC), MediaType: "audio", Kind: "voice"}
+	out := toContractMessage(m, "77000000009@s.whatsapp.net", dir, dir+"/whatsapp")
+	if len(out.Files) != 1 {
+		t.Fatalf("a media row with no filename must still report a file: %+v", out.Files)
+	}
+	if out.Files[0].Path != nil || !out.Files[0].Pending || out.Files[0].Role != "voice" {
+		t.Fatalf("%+v", out.Files[0])
+	}
+	// a message with no media at all still reports no files
+	plain := toContractMessage(ArrivedMessage{ID: "t1", ChatJID: m.ChatJID, Sender: m.Sender,
+		Timestamp: m.Timestamp, Content: "hi", Kind: "chat"}, "77000000009@s.whatsapp.net", dir, dir+"/whatsapp")
+	if len(plain.Files) != 0 {
+		t.Fatalf("text message: %+v", plain.Files)
+	}
+}
+
 func TestClassifyProtocolRevokeAndEdit(t *testing.T) {
 	revoke := &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
 		Type: waE2E.ProtocolMessage_REVOKE.Enum(), Key: &waCommon.MessageKey{ID: proto.String("m1")}}}

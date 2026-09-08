@@ -152,14 +152,18 @@ func toContractMessage(m ArrivedMessage, ownerJID, sharedRoot, downloadDir strin
 			out.EditedAt = &at
 		}
 	}
-	if m.MediaType != "" && m.Filename != "" {
+	if m.MediaType != "" {
 		f := contractFile{Mime: mimeFor(m.MediaType, m.Filename), Role: roleFor(m.MediaType), Pending: true}
 		if len(m.FileSHA256) > 0 {
 			h := hex.EncodeToString(m.FileSHA256)
 			f.SHA256 = &h
 		}
+		// A media row whose filename we never learned still gets an entry:
+		// pending, with no path. Emitting nothing would make the file
+		// invisible to Mindet, and therefore unaskable — /media can still
+		// fetch it by message id.
 		abs := filepath.Join(downloadDir, m.ChatJID, m.Filename)
-		if _, err := os.Stat(abs); err == nil {
+		if _, err := os.Stat(abs); err == nil && m.Filename != "" {
 			if rel, err := filepath.Rel(sharedRoot, abs); err == nil && !strings.HasPrefix(rel, "..") {
 				f.Path = &rel
 				f.Pending = false
