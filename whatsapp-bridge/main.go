@@ -196,7 +196,7 @@ func createTables(db *sql.DB) error {
 		return fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	return nil
+	return ensureContractColumns(db)
 }
 
 // Close the database connection
@@ -227,40 +227,8 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 // StoreMessage Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
-	if content == "" && mediaType == "" {
-		return nil
-	}
-
-	if !isPostgres {
-		_, err := store.db.Exec(
-			`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
-		)
-		return err
-	}
-	_, err := store.db.Exec(
-		`INSERT INTO messages 
-    (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-    ON CONFLICT(id, chat_jid) DO UPDATE SET 
-    chat_jid = EXCLUDED.chat_jid,
-    sender = EXCLUDED.sender,
-    content = EXCLUDED.content,
-    timestamp = EXCLUDED.timestamp,
-    is_from_me = EXCLUDED.is_from_me,
-    media_type = EXCLUDED.media_type,
-    filename = EXCLUDED.filename,
-    url = EXCLUDED.url,
-    media_key = EXCLUDED.media_key,
-    file_sha256 = EXCLUDED.file_sha256,
-    file_enc_sha256 = EXCLUDED.file_enc_sha256,
-    file_length = EXCLUDED.file_length`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
-	)
-
-	return err
+	return store.StoreMessageKind(id, chatJID, sender, content, timestamp, isFromMe,
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, "", "")
 }
 
 // Extract text content from a message

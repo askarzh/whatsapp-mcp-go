@@ -1,0 +1,214 @@
+package main
+
+import (
+	"database/sql"
+	"fmt"
+	"strings"
+	"time"
+)
+
+// The contract needs three things the original schema never had: the order
+// in which *we* received each message (the cursor), when we received it
+// (`until`), and a place for edits and deletions to be messages of their own.
+// Adding columns is the only migration this bridge has ever needed, so it
+// stays inline: idempotent ALTERs, then a one-time backfill.
+func ensureContractColumns(db *sql.DB) error {
+	cols := []string{
+		"arrival_seq BIGINT", "arrived_at_unix BIGINT", "kind TEXT", "edits TEXT",
+	}
+	for _, c := range cols {
+		name := strings.Fields(c)[0]
+		if hasColumn(db, "messages", name) {
+			continue
+		}
+		if _, err := db.Exec("ALTER TABLE messages ADD COLUMN " + c); err != nil {
+			return fmt.Errorf("add column %s: %v", name, err)
+		}
+	}
+	if isPostgres {
+		if _, err := db.Exec(`CREATE SEQUENCE IF NOT EXISTS messages_arrival_seq`); err != nil {
+			return err
+		}
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS sent_by_key (
+		idempotency_key TEXT PRIMARY KEY, native_id TEXT NOT NULL, sent_at_unix BIGINT NOT NULL)`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS ix_messages_arrival ON messages (arrival_seq)`); err != nil {
+		return err
+	}
+	return backfillArrival(db)
+}
+
+func hasColumn(db *sql.DB, table, column string) bool {
+	var q string
+	if isPostgres {
+		q = fmt.Sprintf(`SELECT 1 FROM information_schema.columns WHERE table_name=%s AND column_name=%s`,
+			placeholder(1), placeholder(2))
+	} else {
+		q = `SELECT 1 FROM pragma_table_info(?) WHERE name = ?`
+	}
+	var one int
+	return db.QueryRow(q, table, column).Scan(&one) == nil
+}
+
+// Rows written before the columns existed get an arrival order that follows
+// their WhatsApp time: the best guess there is, and a stable one.
+func backfillArrival(db *sql.DB) error {
+	var q string
+	if isPostgres {
+		q = `UPDATE messages m SET arrival_seq = s.rn, arrived_at_unix = EXTRACT(EPOCH FROM m.timestamp)::bigint
+		     FROM (SELECT id, chat_jid, row_number() OVER (ORDER BY timestamp, id) AS rn FROM messages WHERE arrival_seq IS NULL) s
+		     WHERE m.id = s.id AND m.chat_jid = s.chat_jid`
+	} else {
+		q = `UPDATE messages SET
+		       arrival_seq = (SELECT rn FROM (SELECT id, chat_jid, row_number() OVER (ORDER BY timestamp, id) AS rn FROM messages WHERE arrival_seq IS NULL) s
+		                      WHERE s.id = messages.id AND s.chat_jid = messages.chat_jid),
+		       arrived_at_unix = CAST(strftime('%s', timestamp) AS INTEGER)
+		     WHERE arrival_seq IS NULL`
+	}
+	if _, err := db.Exec(q); err != nil {
+		return fmt.Errorf("backfill arrival: %v", err)
+	}
+	if isPostgres {
+		_, err := db.Exec(`SELECT setval('messages_arrival_seq', coalesce((SELECT max(arrival_seq) FROM messages), 0) + 1, false)`)
+		return err
+	}
+	return nil
+}
+
+// nextArrivalSQL is the expression that allocates the next arrival sequence
+// inside an INSERT: a real sequence on Postgres, max+1 on SQLite, where the
+// bridge is the single writer.
+func nextArrivalSQL() string {
+	if isPostgres {
+		return "nextval('messages_arrival_seq')"
+	}
+	return "(SELECT coalesce(max(arrival_seq), 0) + 1 FROM messages)"
+}
+
+// A message with nothing to say is dropped, as before — unless it is a
+// correction, whose whole point may be that it says nothing (a deletion).
+func (store *MessageStore) StoreMessageKind(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64, kind, edits string) error {
+	if content == "" && mediaType == "" && kind != "tombstone" && kind != "edit" {
+		return nil
+	}
+	if kind == "" {
+		kind = "chat"
+		if mediaType == "audio" {
+			kind = "voice"
+		}
+	}
+	now := time.Now().Unix()
+	cols := "(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, kind, edits, arrival_seq, arrived_at_unix)"
+	ph := make([]string, 0, 16)
+	for i := 1; i <= 16; i++ {
+		ph = append(ph, placeholder(i))
+	}
+	// arrival_seq and arrived_at_unix are NOT in the update list: a re-store
+	// (history sync after a live delivery) keeps the row's place in time.
+	q := fmt.Sprintf(`INSERT INTO messages %s VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+		ON CONFLICT (id, chat_jid) DO UPDATE SET
+		sender = EXCLUDED.sender, content = EXCLUDED.content, timestamp = EXCLUDED.timestamp,
+		is_from_me = EXCLUDED.is_from_me, media_type = EXCLUDED.media_type, filename = EXCLUDED.filename,
+		url = EXCLUDED.url, media_key = EXCLUDED.media_key, file_sha256 = EXCLUDED.file_sha256,
+		file_enc_sha256 = EXCLUDED.file_enc_sha256, file_length = EXCLUDED.file_length,
+		kind = EXCLUDED.kind, edits = EXCLUDED.edits`,
+		cols, ph[0], ph[1], ph[2], ph[3], ph[4], ph[5], ph[6], ph[7], ph[8], ph[9], ph[10], ph[11], ph[12], ph[13], ph[14],
+		nextArrivalSQL(), ph[15])
+	_, err := store.db.Exec(q, id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url,
+		mediaKey, fileSHA256, fileEncSHA256, fileLength, kind, edits, now)
+	return err
+}
+
+type ArrivedMessage struct {
+	Seq           int64
+	ArrivedAt     time.Time
+	ID, ChatJID   string
+	Sender        string
+	Content       string
+	Timestamp     time.Time
+	IsFromMe      bool
+	MediaType     string
+	Filename, URL string
+	MediaKey      []byte
+	FileSHA256    []byte
+	FileEncSHA256 []byte
+	FileLength    uint64
+	Kind, Edits   string
+}
+
+const arrivedCols = `arrival_seq, arrived_at_unix, id, chat_jid, sender, coalesce(content,''), timestamp, is_from_me,
+	coalesce(media_type,''), coalesce(filename,''), coalesce(url,''), media_key, file_sha256, file_enc_sha256,
+	coalesce(file_length,0), coalesce(kind,''), coalesce(edits,'')`
+
+func scanArrived(rows *sql.Rows) (ArrivedMessage, error) {
+	var m ArrivedMessage
+	var arrived int64
+	var fileLength int64
+	err := rows.Scan(&m.Seq, &arrived, &m.ID, &m.ChatJID, &m.Sender, &m.Content, &m.Timestamp, &m.IsFromMe,
+		&m.MediaType, &m.Filename, &m.URL, &m.MediaKey, &m.FileSHA256, &m.FileEncSHA256, &fileLength, &m.Kind, &m.Edits)
+	m.ArrivedAt = time.Unix(arrived, 0).UTC()
+	m.Timestamp = m.Timestamp.UTC()
+	m.FileLength = uint64(fileLength)
+	if m.Kind == "" {
+		m.Kind = "chat"
+		if m.MediaType == "audio" {
+			m.Kind = "voice"
+		}
+	}
+	return m, err
+}
+
+// ListArrived is the contract's page: strictly after a sequence, at most
+// limit, bounded by arrival time when until is set.
+func (store *MessageStore) ListArrived(afterSeq int64, until time.Time, limit int) ([]ArrivedMessage, error) {
+	q := fmt.Sprintf(`SELECT %s FROM messages WHERE arrival_seq > %s`, arrivedCols, placeholder(1))
+	args := []any{afterSeq}
+	if !until.IsZero() {
+		q += fmt.Sprintf(` AND arrived_at_unix <= %s`, placeholder(2))
+		args = append(args, until.Unix())
+	}
+	q += fmt.Sprintf(` ORDER BY arrival_seq LIMIT %s`, placeholder(len(args)+1))
+	args = append(args, limit)
+	rows, err := store.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ArrivedMessage
+	for rows.Next() {
+		m, err := scanArrived(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (store *MessageStore) LastArrival() (time.Time, bool, error) {
+	var v sql.NullInt64
+	if err := store.db.QueryRow(`SELECT max(arrived_at_unix) FROM messages`).Scan(&v); err != nil {
+		return time.Time{}, false, err
+	}
+	if !v.Valid {
+		return time.Time{}, false, nil
+	}
+	return time.Unix(v.Int64, 0).UTC(), true, nil
+}
+
+func (store *MessageStore) LookupMessage(id, chatJID string) (*ArrivedMessage, error) {
+	rows, err := store.db.Query(fmt.Sprintf(`SELECT %s FROM messages WHERE id = %s AND chat_jid = %s`,
+		arrivedCols, placeholder(1), placeholder(2)), id, chatJID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, rows.Err()
+	}
+	m, err := scanArrived(rows)
+	return &m, err
+}
