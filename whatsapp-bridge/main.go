@@ -548,6 +548,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	content := extractTextContent(msg.Message)
 
+	if kind, edits, text, ok := classifyProtocol(msg.Message); ok {
+		if err := messageStore.StoreMessageKind(msg.Info.ID, chatJID, sender, text, msg.Info.Timestamp,
+			msg.Info.IsFromMe, "", "", "", nil, nil, nil, 0, kind, edits); err != nil {
+			logger.Warnf("Failed to store %s: %v", kind, err)
+		}
+		return
+	}
+
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
 	if content == "" && mediaType == "" {
