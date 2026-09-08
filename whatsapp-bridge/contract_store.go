@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -36,10 +38,43 @@ func ensureContractColumns(db *sql.DB) error {
 		idempotency_key TEXT PRIMARY KEY, native_id TEXT NOT NULL, sent_at_unix BIGINT NOT NULL)`); err != nil {
 		return err
 	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS contract_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
+		return err
+	}
+	// The generation is written once and never again, so a cursor can say
+	// which store it came from. A recreated volume or a restore from an
+	// older dump gets a new one, and every cursor from the old store is
+	// then a 400 rather than a page that is empty for the wrong reason.
+	gen := make([]byte, 8)
+	if _, err := rand.Read(gen); err != nil {
+		return err
+	}
+	if _, err := db.Exec(fmt.Sprintf(
+		`INSERT INTO contract_meta (key, value) VALUES ('generation', %s) ON CONFLICT DO NOTHING`,
+		placeholder(1)), hex.EncodeToString(gen)); err != nil {
+		return err
+	}
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS ix_messages_arrival ON messages (arrival_seq)`); err != nil {
 		return err
 	}
 	return backfillArrival(db)
+}
+
+// Generation identifies this store, for the lifetime of its data. Read once
+// and remembered: it cannot change under a running process.
+func (store *MessageStore) Generation() string {
+	store.genMu.Lock()
+	defer store.genMu.Unlock()
+	if store.generation != "" {
+		return store.generation
+	}
+	var v string
+	if err := store.db.QueryRow(`SELECT value FROM contract_meta WHERE key = 'generation'`).Scan(&v); err != nil {
+		slog.Warn("contract: no store generation; cursors cannot detect a rebuilt store", "err", err)
+		return ""
+	}
+	store.generation = v
+	return v
 }
 
 func hasColumn(db *sql.DB, table, column string) bool {

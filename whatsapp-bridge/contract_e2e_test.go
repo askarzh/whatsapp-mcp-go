@@ -42,13 +42,13 @@ func TestEndToEndArrivalOrderEditsAndMedia(t *testing.T) {
 	if want := []string{"chat", "chat", "voice", "edit", "tombstone"}; !equal(kinds, want) {
 		t.Fatalf("kinds %v", kinds)
 	}
-	_, before := get(t, srv.URL+"/bridge/v1/messages?limit=1&since="+encodeCursor(2), testToken)
+	_, before := get(t, srv.URL+"/bridge/v1/messages?limit=1&since="+encodeCursor(s.Generation(), 2), testToken)
 	f := before["messages"].([]any)[0].(map[string]any)["files"].([]any)[0].(map[string]any)
 	if f["path"] != nil || f["pending"] != true {
 		t.Fatalf("voice note must be pending before media: %+v", f)
 	}
 	get(t, srv.URL+"/bridge/v1/media/v1?chat="+chat, testToken)
-	_, after := get(t, srv.URL+"/bridge/v1/messages?limit=1&since="+encodeCursor(2), testToken)
+	_, after := get(t, srv.URL+"/bridge/v1/messages?limit=1&since="+encodeCursor(s.Generation(), 2), testToken)
 	f = after["messages"].([]any)[0].(map[string]any)["files"].([]any)[0].(map[string]any)
 	if f["path"] != "whatsapp/"+chat+"/v1.ogg" {
 		t.Fatalf("voice note path after media: %+v", f)

@@ -249,6 +249,34 @@ func TestMessagesPagingCursorAndUntil(t *testing.T) {
 	}
 }
 
+// A store rebuilt from an empty volume, or restored from an older dump,
+// restarts its arrival sequence. Mindet's held cursor then names a place in
+// a store that no longer exists: answering it with an empty page would look
+// exactly like "nothing new" and stall ingestion forever, so it is a 400 —
+// the one answer Mindet re-bootstraps on.
+func TestCursorFromAnotherStoreIsRejected(t *testing.T) {
+	srv, s, _ := newContractServer(t)
+	mustExec(t, s.db, `INSERT INTO chats (jid, name) VALUES ('77000000001@s.whatsapp.net', 'x')`)
+	_ = s.StoreMessage("a", "77000000001@s.whatsapp.net", "77000000001", "a", time.Now().UTC(), false, "", "", "", nil, nil, nil, 0)
+
+	foreign := encodeCursor("deadbeefdeadbeef", 1)
+	r, body := get(t, srv.URL+"/bridge/v1/messages?since="+foreign, testToken)
+	if r.StatusCode != 400 || !strings.Contains(fmt.Sprint(body["error"]), "different store") {
+		t.Fatalf("foreign cursor: %d %+v", r.StatusCode, body)
+	}
+	// the pre-generation cursor form is just as stale
+	if r, _ := get(t, srv.URL+"/bridge/v1/messages?since=djE6NTAwMDA", testToken); r.StatusCode != 400 {
+		t.Fatalf("cursor with no generation must be 400, got %d", r.StatusCode)
+	}
+	// ours still works
+	if r, _ := get(t, srv.URL+"/bridge/v1/messages?since="+encodeCursor(s.Generation(), 0), testToken); r.StatusCode != 200 {
+		t.Fatalf("our own cursor: %d", r.StatusCode)
+	}
+	if s.Generation() == "" {
+		t.Fatal("a store must have a generation")
+	}
+}
+
 func TestChatsAndContacts(t *testing.T) {
 	srv, _, _ := newContractServer(t, func(s *MessageStore) {
 		mustExec(t, s.db, `INSERT INTO chats (jid, name) VALUES

@@ -107,6 +107,11 @@ type Message struct {
 
 type MessageStore struct {
 	db *sql.DB
+
+	// generation identifies the store's data to the contract's cursor; it is
+	// read from contract_meta on first use and cached (see Generation).
+	genMu      sync.Mutex
+	generation string
 }
 
 var isPostgres = false

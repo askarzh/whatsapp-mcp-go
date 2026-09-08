@@ -131,11 +131,19 @@ func parseAware(s string) (time.Time, error) {
 
 func (d *contractDeps) messages(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	generation := d.Store.Generation()
 	var after int64
 	if s := q.Get("since"); s != "" {
-		seq, err := decodeCursor(s)
+		gen, seq, err := decodeCursor(s)
 		if err != nil {
 			writeErr(w, 400, err.Error())
+			return
+		}
+		// A cursor from a store that no longer exists (rebuilt volume,
+		// restore from a dump) would silently point past everything we hold.
+		// 400 is what makes Mindet start over instead of polling nothing.
+		if gen != generation {
+			writeErr(w, 400, ErrBadCursor.Error()+": this cursor was issued by a different store; start again with no cursor")
 			return
 		}
 		after = seq
@@ -165,10 +173,10 @@ func (d *contractDeps) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := make([]contractMessage, 0, len(rows))
-	next := encodeCursor(after) // the terminal page echoes what it was given
+	next := encodeCursor(generation, after) // the terminal page echoes what it was given
 	for _, m := range rows {
 		out = append(out, toContractMessage(m, d.OwnerJID(), d.Cfg.MediaSharedRoot, d.Cfg.MediaDownloadDir))
-		next = encodeCursor(m.Seq)
+		next = encodeCursor(generation, m.Seq)
 	}
 	writeJSON(w, 200, map[string]any{"messages": out, "next": next})
 }
