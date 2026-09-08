@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -100,5 +102,111 @@ func TestBackfillGivesExistingRowsAnArrivalOrderBySentAt(t *testing.T) {
 	last, ok, _ := s.LastArrival()
 	if !ok || last.IsZero() {
 		t.Fatalf("LastArrival: %v %v", last, ok)
+	}
+}
+
+// A send reserves its idempotency key before it happens, so a crash between
+// reserving and sending leaves a row that means "in flight" for a process
+// that no longer exists. Without a way back, that key is 409 forever and the
+// message can never be sent.
+func TestAStaleSendReservationCanBeReclaimed(t *testing.T) {
+	s := newTestMessageStore(t)
+	first, err := s.ReserveSend("k1")
+	if err != nil || !first {
+		t.Fatalf("first reservation: %v %v", first, err)
+	}
+	again, err := s.ReserveSend("k1")
+	if err != nil || again {
+		t.Fatalf("a fresh reservation must still block a second send: %v %v", again, err)
+	}
+	// the same reservation, older than any send could plausibly be
+	mustExec(t, s.db, `UPDATE sent_by_key SET sent_at_unix = ? WHERE idempotency_key = 'k1'`,
+		time.Now().Add(-11*time.Minute).Unix())
+	reclaimed, err := s.ReserveSend("k1")
+	if err != nil || !reclaimed {
+		t.Fatalf("a reservation older than the TTL must be reclaimable: %v %v", reclaimed, err)
+	}
+	// a completed send is not a reservation and is never reclaimed
+	if err := s.CompleteSend("k1", "3AC2", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, s.db, `UPDATE sent_by_key SET sent_at_unix = ? WHERE idempotency_key = 'k1'`,
+		time.Now().Add(-99*time.Hour).Unix())
+	if taken, err := s.ReserveSend("k1"); err != nil || taken {
+		t.Fatalf("a finished send must keep its answer: %v %v", taken, err)
+	}
+	if id, _, ok, err := s.RecallSend("k1"); err != nil || !ok || id != "3AC2" {
+		t.Fatalf("recall: %q %v %v", id, ok, err)
+	}
+}
+
+// Startup clears reservations no live process can own any more.
+func TestStartupDropsReservationsLeftByADeadProcess(t *testing.T) {
+	s := newTestMessageStore(t)
+	if _, err := s.ReserveSend("k2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureContractColumns(s.db); err != nil { // stands in for a restart
+		t.Fatal(err)
+	}
+	if free, err := s.ReserveSend("k2"); err != nil || !free {
+		t.Fatalf("a restart must free an unfinished reservation: %v %v", free, err)
+	}
+}
+
+// Live delivery and a history-sync batch write at the same time; every
+// message must get an arrival sequence of its own or Mindet's cursor steps
+// over one. Run with -race.
+func TestConcurrentStoresGetDistinctArrivalSequences(t *testing.T) {
+	s := newTestMessageStore(t)
+	mustExec(t, s.db, `INSERT INTO chats (jid, name) VALUES ('c@s.whatsapp.net', 'x')`)
+	const n = 50
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs <- s.StoreMessage(fmt.Sprintf("m%02d", i), "c@s.whatsapp.net", "c", "hi",
+				time.Now().UTC(), false, "", "", "", nil, nil, nil, 0)
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("store: %v", err)
+		}
+	}
+	rows, err := s.ListArrived(0, time.Time{}, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != n {
+		t.Fatalf("stored %d of %d messages", len(rows), n)
+	}
+	seen := map[int64]bool{}
+	for _, m := range rows {
+		if seen[m.Seq] {
+			t.Fatalf("arrival sequence %d handed out twice", m.Seq)
+		}
+		seen[m.Seq] = true
+	}
+	// and every one of them is reachable by paging one at a time
+	var walked int
+	cursor := int64(0)
+	for {
+		page, err := s.ListArrived(cursor, time.Time{}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		walked++
+		cursor = page[0].Seq
+	}
+	if walked != n {
+		t.Fatalf("paging handed out %d of %d messages", walked, n)
 	}
 }

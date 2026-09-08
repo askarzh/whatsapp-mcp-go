@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,6 +37,13 @@ func ensureContractColumns(db *sql.DB) error {
 	}
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS sent_by_key (
 		idempotency_key TEXT PRIMARY KEY, native_id TEXT NOT NULL, sent_at_unix BIGINT NOT NULL)`); err != nil {
+		return err
+	}
+	// A reservation belongs to a send in flight in this process, so it
+	// cannot outlive the process. One left behind by a crash between
+	// reserving and sending would 409 that idempotency key forever: one
+	// message to the boss that can never be sent, retried every tick.
+	if _, err := db.Exec(`DELETE FROM sent_by_key WHERE native_id = ''`); err != nil {
 		return err
 	}
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS contract_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
@@ -124,6 +132,9 @@ func nextArrivalSQL() string {
 	return "(SELECT coalesce(max(arrival_seq), 0) + 1 FROM messages)"
 }
 
+// storeMu serialises arrival-sequence allocation; see StoreMessageKind.
+var storeMu sync.Mutex
+
 // A message with nothing to say is dropped, as before — unless it is a
 // correction, whose whole point may be that it says nothing (a deletion).
 func (store *MessageStore) StoreMessageKind(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
@@ -154,6 +165,16 @@ func (store *MessageStore) StoreMessageKind(id, chatJID, sender, content string,
 		kind = EXCLUDED.kind, edits = EXCLUDED.edits`,
 		cols, ph[0], ph[1], ph[2], ph[3], ph[4], ph[5], ph[6], ph[7], ph[8], ph[9], ph[10], ph[11], ph[12], ph[13], ph[14],
 		nextArrivalSQL(), ph[15])
+	// The arrival sequence is allocated inside this statement — max+1 on
+	// SQLite, nextval on Postgres — and neither is safe against a second
+	// writer. whatsmeow does not promise one: a history-sync batch runs in
+	// its own goroutine for minutes and overlaps live delivery by
+	// construction. Two writers could take the same number (SQLite) or
+	// commit out of order across a poll (Postgres), and Mindet's cursor
+	// would step over a message. The window is milliseconds; the message
+	// might be the directive.
+	storeMu.Lock()
+	defer storeMu.Unlock()
 	_, err := store.db.Exec(q, id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url,
 		mediaKey, fileSHA256, fileEncSHA256, fileLength, kind, edits, now)
 	return err
@@ -207,7 +228,9 @@ func (store *MessageStore) ListArrived(afterSeq int64, until time.Time, limit in
 		q += fmt.Sprintf(` AND arrived_at_unix <= %s`, placeholder(2))
 		args = append(args, until.Unix())
 	}
-	q += fmt.Sprintf(` ORDER BY arrival_seq LIMIT %s`, placeholder(len(args)+1))
+	// id is the tie-break: if two rows ever shared a sequence, an unstable
+	// order could drop one at a page boundary and never hand it out again.
+	q += fmt.Sprintf(` ORDER BY arrival_seq, id LIMIT %s`, placeholder(len(args)+1))
 	args = append(args, limit)
 	rows, err := store.db.Query(q, args...)
 	if err != nil {
@@ -375,13 +398,25 @@ func (store *MessageStore) ListContactsForContract() ([]contractContact, error) 
 // succeeds, and ReleaseSend removes the reservation after a failed send so a
 // retry with the same key is free to try again.
 
+// sendReservationTTL is how long a send may plausibly be in flight. Past it,
+// a reservation with no result is debris from a process that died.
+const sendReservationTTL = 10 * time.Minute
+
 // ReserveSend claims key for a send that is about to happen. It reports
 // whether this call made the reservation: false means the key was already
 // there, either as a finished send (RecallSend has the answer) or as another
 // request's send still in flight.
 func (store *MessageStore) ReserveSend(key string) (bool, error) {
-	res, err := store.db.Exec(fmt.Sprintf(`INSERT INTO sent_by_key (idempotency_key, native_id, sent_at_unix) VALUES (%s, '', 0)
-		ON CONFLICT (idempotency_key) DO NOTHING`, placeholder(1)), key)
+	// A reservation this old cannot still be in flight: the send it belonged
+	// to either finished (and would have a native_id) or died with the
+	// process that made it. Reclaiming it is what lets a crashed send be
+	// retried at all, without waiting for a restart.
+	if _, err := store.db.Exec(fmt.Sprintf(`DELETE FROM sent_by_key WHERE native_id = '' AND sent_at_unix < %s`,
+		placeholder(1)), time.Now().Add(-sendReservationTTL).Unix()); err != nil {
+		return false, err
+	}
+	res, err := store.db.Exec(fmt.Sprintf(`INSERT INTO sent_by_key (idempotency_key, native_id, sent_at_unix) VALUES (%s, '', %s)
+		ON CONFLICT (idempotency_key) DO NOTHING`, placeholder(1), placeholder(2)), key, time.Now().Unix())
 	if err != nil {
 		return false, err
 	}
@@ -416,7 +451,7 @@ func (store *MessageStore) RecallSend(key string) (string, time.Time, bool, erro
 	var at int64
 	err := store.db.QueryRow(fmt.Sprintf(`SELECT native_id, sent_at_unix FROM sent_by_key WHERE idempotency_key = %s`,
 		placeholder(1)), key).Scan(&id, &at)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", time.Time{}, false, nil
 	}
 	if err != nil {

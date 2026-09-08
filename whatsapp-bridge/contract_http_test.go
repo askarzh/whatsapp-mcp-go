@@ -431,7 +431,10 @@ func TestSendInFlightAnswers409WithoutCallingSender(t *testing.T) {
 	srv, s, _ := newContractServer(t)
 	fs := &fakeSender{}
 	setSender(srv, fs)
-	mustExec(t, s.db, `INSERT INTO sent_by_key (idempotency_key, native_id, sent_at_unix) VALUES ('k2', '', 0)`)
+	// stamped now: a reservation this fresh is a send genuinely in flight,
+	// not debris a restart or the TTL sweep would reclaim
+	mustExec(t, s.db, `INSERT INTO sent_by_key (idempotency_key, native_id, sent_at_unix) VALUES ('k2', '', ?)`,
+		time.Now().Unix())
 	r, body := post(t, srv.URL+"/bridge/v1/send", testToken, `{"idempotency_key":"k2","to":{"chat":"c@s.whatsapp.net"},"text":"hi"}`)
 	if r.StatusCode != 409 || body["error"] != "send in flight" || len(fs.sent) != 0 {
 		t.Fatalf("in-flight: %d %+v sent=%v", r.StatusCode, body, fs.sent)
