@@ -25,6 +25,10 @@ FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /project
 COPY --from=builder /project/whatsapp-bridge .
 
+# The contract stamps every sent_at +00:00 and messages.timestamp has no zone
+# of its own, so the process must think in UTC whatever the host runs on.
+ENV TZ=UTC
+
 USER 65532:65532
 
 ENTRYPOINT ["/project/whatsapp-bridge"]

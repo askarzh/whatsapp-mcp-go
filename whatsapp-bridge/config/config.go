@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -22,11 +23,15 @@ type dbConfig struct {
 // URL-escaped, so passwords containing reserved characters don't corrupt it.
 func (d dbConfig) ConnString(dbName string) string {
 	u := url.URL{
-		Scheme:   "postgresql",
-		User:     url.UserPassword(d.User, d.Pass),
-		Host:     d.Host + ":" + d.Port,
-		Path:     "/" + dbName,
-		RawQuery: "sslmode=" + url.QueryEscape(d.SSLMode),
+		Scheme: "postgresql",
+		User:   url.UserPassword(d.User, d.Pass),
+		Host:   d.Host + ":" + d.Port,
+		Path:   "/" + dbName,
+		// timezone=UTC: messages.timestamp is a naive TIMESTAMP, so what the
+		// driver stores and reads back is a wall clock in the session's zone.
+		// Pinning the session to UTC is what makes the +00:00 the contract
+		// puts on every sent_at true (platform spec §7).
+		RawQuery: "sslmode=" + url.QueryEscape(d.SSLMode) + "&timezone=UTC",
 	}
 	return u.String()
 }
@@ -47,6 +52,19 @@ type Config struct {
 	// read — point it at a shared mount (e.g. /shared/whatsapp) when the file
 	// has to be reachable by files-mcp or the MCP server.
 	MediaDownloadDir string
+
+	// MindetBridgeToken is the one static bearer that opens /bridge/v1 for
+	// Mindet. Empty disables the contract surface entirely; it is a separate
+	// door from the JWT that guards /api, so neither caller can use the
+	// other's credential.
+	MindetBridgeToken string
+
+	// MediaSharedRoot is the mount both this bridge and Mindet's daemon can
+	// see; a contract message's file path is relative to it.
+	MediaSharedRoot string
+
+	// PublicURL is where Mindet reaches this bridge.
+	PublicURL string
 }
 
 func LoadConfig() (*Config, error) {
@@ -101,6 +119,23 @@ func LoadConfig() (*Config, error) {
 
 	authLoginRate := os.Getenv("AUTH_LOGIN_RATE") // parsed in auth package; empty -> default
 
+	mindetToken := os.Getenv("MINDET_BRIDGE_TOKEN")
+	if mindetToken != "" {
+		if err := validateSecret("MINDET_BRIDGE_TOKEN", mindetToken); err != nil {
+			return nil, err
+		}
+	} else {
+		envWarnFn("MINDET_BRIDGE_TOKEN not set; /bridge/v1 is disabled")
+	}
+	sharedRoot := os.Getenv("MEDIA_SHARED_ROOT")
+	if sharedRoot == "" {
+		sharedRoot = "/shared"
+	}
+	publicURL := os.Getenv("BRIDGE_PUBLIC_URL")
+	if publicURL == "" {
+		publicURL = fmt.Sprintf("http://localhost:%d", serverPort)
+	}
+
 	sslMode := os.Getenv("POSTGRES_SSLMODE")
 	if sslMode == "" {
 		sslMode = "disable"
@@ -124,6 +159,47 @@ func LoadConfig() (*Config, error) {
 		mediaDirs = []string{"store", os.TempDir()}
 	}
 
+	// The QR link the login flow hands the owner is built from PublicURL. A
+	// localhost default is a link that works only from inside the container,
+	// so with the contract on it is a dead end by construction — the same
+	// shape of coupling as the media dirs below, and worth the same refusal.
+	if mindetToken != "" {
+		raw := os.Getenv("BRIDGE_PUBLIC_URL")
+		if raw == "" {
+			return nil, fmt.Errorf("BRIDGE_PUBLIC_URL must be set when MINDET_BRIDGE_TOKEN is set, " +
+				"to the URL the owner's browser can reach this bridge at: the login QR link is built from it")
+		}
+		host := raw
+		if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
+			host = u.Hostname()
+		}
+		switch host {
+		case "localhost", "127.0.0.1", "::1", "0.0.0.0":
+			return nil, fmt.Errorf("BRIDGE_PUBLIC_URL is still %q; with MINDET_BRIDGE_TOKEN set it must be a URL "+
+				"the owner's browser can reach, or the login QR link the daemon relays points nowhere", raw)
+		}
+	}
+
+	// The contract's file paths are MediaDownloadDir-relative-to-MediaSharedRoot
+	// (spec §3.8): if the download dir isn't inside the shared root, every
+	// files[].path the bridge would hand Mindet is wrong. The bare /api path
+	// has no such requirement, so this only bites when the contract is on.
+	if mindetToken != "" {
+		absDownload, err := filepath.Abs(mediaDownloadDir)
+		if err != nil {
+			return nil, fmt.Errorf("resolving MEDIA_DOWNLOAD_DIR %q: %w", mediaDownloadDir, err)
+		}
+		absShared, err := filepath.Abs(sharedRoot)
+		if err != nil {
+			return nil, fmt.Errorf("resolving MEDIA_SHARED_ROOT %q: %w", sharedRoot, err)
+		}
+		rel, err := filepath.Rel(absShared, absDownload)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf("MEDIA_DOWNLOAD_DIR (%s) must be inside MEDIA_SHARED_ROOT (%s) when MINDET_BRIDGE_TOKEN is set, "+
+				"so /bridge/v1 file paths resolve for Mindet", mediaDownloadDir, sharedRoot)
+		}
+	}
+
 	return &Config{
 		DB: dbConfig{
 			User:       user,
@@ -133,14 +209,17 @@ func LoadConfig() (*Config, error) {
 			IsPostgres: isPostgres,
 			SSLMode:    sslMode,
 		},
-		JWTSecret:        []byte(jwtSecret),
-		APIKey:           apiKey,
-		WebhookUrl:       webhookUrl,
-		Host:             serverHost,
-		Port:             serverPort,
-		AuthLoginRate:    authLoginRate,
-		MediaDirs:        mediaDirs,
-		MediaDownloadDir: mediaDownloadDir,
+		JWTSecret:         []byte(jwtSecret),
+		APIKey:            apiKey,
+		WebhookUrl:        webhookUrl,
+		Host:              serverHost,
+		Port:              serverPort,
+		AuthLoginRate:     authLoginRate,
+		MediaDirs:         mediaDirs,
+		MediaDownloadDir:  mediaDownloadDir,
+		MindetBridgeToken: mindetToken,
+		MediaSharedRoot:   sharedRoot,
+		PublicURL:         publicURL,
 	}, nil
 }
 

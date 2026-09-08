@@ -36,6 +36,29 @@ func resolveSenderPN(ctx context.Context, lids store.LIDStore, info types.Messag
 	return resolvePNJID(ctx, lids, info.Sender)
 }
 
+// senderKeyOf is what the messages table holds for a sender. A phone-number
+// JID is stored as its bare user part, the way this bridge always has; a
+// sender still hidden behind a linked id keeps its "@lid" suffix, so nothing
+// downstream can mistake those digits for a phone number. applyOneLIDMapping
+// rewrites both forms once the mapping is learned.
+func senderKeyOf(jid types.JID) string {
+	if jid.Server == types.HiddenUserServer {
+		// The device suffix (":23") varies per client the peer uses; the
+		// person does not. Drop it so one linked id names one sender.
+		return jid.ToNonAD().String()
+	}
+	return jid.User
+}
+
+// storedSender decides what a live message's sender column gets, given the
+// message as delivered and the best phone-number form we could resolve.
+func storedSender(info types.MessageInfo, resolved types.JID) string {
+	if resolved.IsEmpty() {
+		resolved = info.Sender
+	}
+	return senderKeyOf(resolved)
+}
+
 // applyLIDMappings re-keys @lid chats and senders in the bridge DB to their
 // phone-number JIDs. nameFor supplies a display name for a phone-number JID
 // when neither the lid nor pn chat row has a usable one; it may be nil.

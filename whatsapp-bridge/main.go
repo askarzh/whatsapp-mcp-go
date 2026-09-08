@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -106,6 +107,11 @@ type Message struct {
 
 type MessageStore struct {
 	db *sql.DB
+
+	// generation identifies the store's data to the contract's cursor; it is
+	// read from contract_meta on first use and cached (see Generation).
+	genMu      sync.Mutex
+	generation string
 }
 
 var isPostgres = false
@@ -196,7 +202,7 @@ func createTables(db *sql.DB) error {
 		return fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	return nil
+	return ensureContractColumns(db)
 }
 
 // Close the database connection
@@ -227,40 +233,8 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 // StoreMessage Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
-	if content == "" && mediaType == "" {
-		return nil
-	}
-
-	if !isPostgres {
-		_, err := store.db.Exec(
-			`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
-		)
-		return err
-	}
-	_, err := store.db.Exec(
-		`INSERT INTO messages 
-    (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-    ON CONFLICT(id, chat_jid) DO UPDATE SET 
-    chat_jid = EXCLUDED.chat_jid,
-    sender = EXCLUDED.sender,
-    content = EXCLUDED.content,
-    timestamp = EXCLUDED.timestamp,
-    is_from_me = EXCLUDED.is_from_me,
-    media_type = EXCLUDED.media_type,
-    filename = EXCLUDED.filename,
-    url = EXCLUDED.url,
-    media_key = EXCLUDED.media_key,
-    file_sha256 = EXCLUDED.file_sha256,
-    file_enc_sha256 = EXCLUDED.file_enc_sha256,
-    file_length = EXCLUDED.file_length`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
-	)
-
-	return err
+	return store.StoreMessageKind(id, chatJID, sender, content, timestamp, isFromMe,
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, "", "")
 }
 
 // Extract text content from a message
@@ -329,20 +303,19 @@ func CustomGetLatestVersion(ctx context.Context, httpClient *http.Client) (*stor
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (id string, sentAt time.Time, err error) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return "", time.Time{}, errors.New("not connected to WhatsApp")
 	}
 
 	var recipientJID types.JID
-	var err error
 
 	isJID := strings.Contains(recipient, "@")
 
 	if isJID {
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return "", time.Time{}, fmt.Errorf("error parsing JID: %v", err)
 		}
 	} else {
 		recipientJID = types.JID{
@@ -356,7 +329,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	if mediaPath != "" {
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return "", time.Time{}, fmt.Errorf("error reading media file: %v", err)
 		}
 
 		fileExt := strings.ToLower(mediaPath[strings.LastIndex(mediaPath, ".")+1:])
@@ -398,7 +371,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return "", time.Time{}, fmt.Errorf("error uploading media: %v", err)
 		}
 
 		slog.Info("media uploaded", "response", resp)
@@ -425,7 +398,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return "", time.Time{}, fmt.Errorf("failed to analyze Ogg Opus file: %v", err)
 				}
 			} else {
 				slog.Warn("not an Ogg Opus file", "mime_type", mimeType)
@@ -471,13 +444,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		msg.Conversation = proto.String(message)
 	}
 
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
-
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return "", time.Time{}, fmt.Errorf("error sending message: %v", err)
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	return resp.ID, resp.Timestamp, nil
 }
 
 // Extract media info from a message
@@ -568,7 +540,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	ctx := context.Background()
 	chat := resolvePNJID(ctx, client.Store.LIDs, msg.Info.Chat)
 	chatJID := chat.String()
-	sender := resolveSenderPN(ctx, client.Store.LIDs, msg.Info).User
+	sender := storedSender(msg.Info, resolveSenderPN(ctx, client.Store.LIDs, msg.Info))
 
 	name := GetChatName(client, messageStore, chat, chatJID, nil,
 		nameHintForChat(msg.Info.IsFromMe, sender), logger)
@@ -579,6 +551,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 
 	content := extractTextContent(msg.Message)
+
+	if kind, edits, text, ok := classifyProtocol(msg.Message); ok {
+		if err := messageStore.StoreMessageKind(msg.Info.ID, chatJID, sender, text, msg.Info.Timestamp,
+			msg.Info.IsFromMe, "", "", "", nil, nil, nil, 0, kind, edits); err != nil {
+			logger.Warnf("Failed to store %s: %v", kind, err)
+		}
+		return
+	}
 
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
@@ -734,10 +714,12 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// chatJID comes from the request and filename from the sender of the
-	// message; both must be confined to the store directory.
+	// message; both must be confined to the store directory. A refusal here
+	// is never something a retry will fix — there is no file to ask for
+	// under a JID or filename that can't even be turned into a path.
 	chatDir, err := safeChildPath(downloadDir, chatJID)
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("invalid chat JID: %v", err)
+		return false, "", "", "", fmt.Errorf("%w: invalid chat JID: %v", errMediaUnknown, err)
 	}
 	localPath := ""
 
@@ -757,12 +739,18 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		}
 
 		if err != nil {
+			// Only "no such row" means the message itself is unknown; any
+			// other database error (a dropped connection, say) is worth
+			// retrying and must not be mistaken for a permanent 404.
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, "", "", "", fmt.Errorf("%w: %v", errMediaUnknown, err)
+			}
 			return false, "", "", "", fmt.Errorf("failed to find message: %v", err)
 		}
 	}
 
 	if mediaType == "" {
-		return false, "", "", "", fmt.Errorf("not a media message")
+		return false, "", "", "", fmt.Errorf("%w: not a media message", errMediaUnknown)
 	}
 
 	if err := os.MkdirAll(chatDir, 0755); err != nil {
@@ -771,7 +759,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	localPath, err = safeChildPath(chatDir, filename)
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("invalid media filename: %v", err)
+		return false, "", "", "", fmt.Errorf("%w: invalid media filename: %v", errMediaUnknown, err)
 	}
 
 	absPath, err := filepath.Abs(localPath)
@@ -784,7 +772,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	if url == "" || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
-		return false, "", "", "", fmt.Errorf("incomplete media information for download")
+		return false, "", "", "", fmt.Errorf("%w: no keys stored for this message", errMediaGone)
 	}
 
 	slog.Info("attempting to download media", "message_id", messageID, "chat_jid", chatJID)
@@ -802,7 +790,9 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	case "document":
 		waMediaType = whatsmeow.MediaDocument
 	default:
-		return false, "", "", "", fmt.Errorf("unsupported media type: %s", mediaType)
+		// A media_type this bridge itself never writes is data, not a
+		// hiccup: no retry teaches it a fifth kind.
+		return false, "", "", "", fmt.Errorf("%w: unsupported media type %q", errMediaUnknown, mediaType)
 	}
 
 	downloader := &MediaDownloader{
@@ -817,7 +807,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+		return false, "", "", "", classifyDownloadErr(err)
 	}
 
 	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
@@ -826,6 +816,27 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	slog.Info("successfully downloaded media", "media_type", mediaType, "path", absPath, "bytes", len(mediaData))
 	return true, mediaType, filename, absPath, nil
+}
+
+// classifyDownloadErr says how Mindet should treat a client.Download
+// failure: a CDN 403/404/410 or a missing url is gone for good (§3.5's 410);
+// so are whatsmeow's own deterministic decrypt errors — the plaintext will
+// never hash right, the HMAC will never verify, the file will never grow —
+// no retry changes any of that. Anything else (a dropped connection, a
+// timeout) is left as a plain error, retried as a transient 500.
+func classifyDownloadErr(err error) error {
+	var httpErr whatsmeow.DownloadHTTPError
+	if errors.As(err, &httpErr) && (httpErr.Response.StatusCode == 403 || httpErr.Response.StatusCode == 404 || httpErr.Response.StatusCode == 410) {
+		return fmt.Errorf("%w: cdn %d", errMediaGone, httpErr.Response.StatusCode)
+	}
+	switch {
+	case errors.Is(err, whatsmeow.ErrNoURLPresent),
+		errors.Is(err, whatsmeow.ErrInvalidMediaSHA256),
+		errors.Is(err, whatsmeow.ErrInvalidMediaHMAC),
+		errors.Is(err, whatsmeow.ErrTooShortFile):
+		return fmt.Errorf("%w: %v", errMediaGone, err)
+	}
+	return fmt.Errorf("failed to download media: %v", err)
 }
 
 func extractDirectPathFromURL(url string) string {
@@ -841,6 +852,31 @@ func extractDirectPathFromURL(url string) string {
 	// appends "&hash=...&mms-type=...&__wa-mms=" to this path, so WhatsApp's own
 	// ?ccb/oh/oe/_nc_sid params must still be attached or the CDN returns 403.
 	return "/" + parts[1]
+}
+
+// waMedia and waSender adapt the real client and store to the contract's
+// mediaFetcher and messageSender interfaces (contract_http.go).
+type waMedia struct {
+	client *whatsmeow.Client
+	store  *MessageStore
+	dir    string
+}
+
+func (m waMedia) Fetch(id, chat string) (string, error) {
+	_, _, _, abs, err := downloadMedia(m.client, m.store, id, chat, m.dir)
+	return abs, err
+}
+
+type waSender struct{ client *whatsmeow.Client }
+
+func (s waSender) Send(chat, text, media string) (string, time.Time, error) {
+	return sendWhatsAppMessage(s.client, chat, text, media)
+}
+
+type waPairer struct{ client *whatsmeow.Client }
+
+func (p waPairer) PairPhone(ctx context.Context, phone string) (string, error) {
+	return p.client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -882,7 +918,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 
 		slog.Info("received request to send message", "message", req.Message, "media_path", req.MediaPath)
 
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		_, _, err := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success := err == nil
+		message := fmt.Sprintf("Message sent to %s", req.Recipient)
+		if err != nil {
+			message = err.Error()
+		}
 		slog.Info("message sent", "success", success, "message", message)
 		w.Header().Set("Content-Type", "application/json")
 
@@ -1286,6 +1327,30 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 	http.Handle("/api/", http.StripPrefix("/api", protected))
 	http.Handle("/auth/login", auth.LoginHandler(cfg))
 
+	// Mindet's own surface: a static bearer, not the JWT above. Empty token
+	// means Mindet isn't deployed against this bridge yet, so the mount
+	// itself stays off.
+	if cfg.MindetBridgeToken != "" {
+		deps := &contractDeps{Store: messageStore, State: state, Cfg: cfg,
+			OwnerJID: func() string {
+				if client.Store.ID == nil {
+					return ""
+				}
+				return client.Store.ID.ToNonAD().String()
+			},
+			Media:  waMedia{client, messageStore, cfg.MediaDownloadDir},
+			Sender: waSender{client},
+			Login:  newLoginFlow(state, waPairer{client}, cfg.PublicURL),
+		}
+		http.Handle("/bridge/v1/", http.StripPrefix("/bridge/v1", newContractMux(deps)))
+		// The QR link's token is itself the secret, so these three ride the
+		// outer default mux without the bearer gate; Go's ServeMux picks the
+		// more specific pattern over the "/bridge/v1/" catch-all above.
+		http.HandleFunc("GET /bridge/v1/qr/{token}", deps.Login.QRPage)
+		http.HandleFunc("GET /bridge/v1/qr/{token}/png", deps.Login.QRPNG)
+		http.HandleFunc("GET /bridge/v1/qr/{token}/status", deps.Login.QRStatus)
+	}
+
 	serverAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	slog.Info("starting REST API server", "addr", serverAddr)
 
@@ -1446,15 +1511,15 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 						// Participants can be @lid; store the phone-number
 						// user part when the mapping is known.
 						if pJID, err := types.ParseJID(sender); err == nil {
-							sender = resolvePNJID(context.Background(), client.Store.LIDs, pJID).User
+							sender = senderKeyOf(resolvePNJID(context.Background(), client.Store.LIDs, pJID))
 						}
 					} else if isFromMe {
 						sender = client.Store.ID.User
 					} else {
-						sender = jid.User
+						sender = senderKeyOf(jid)
 					}
 				} else {
-					sender = jid.User
+					sender = senderKeyOf(jid)
 				}
 
 				msgID := ""
@@ -2587,6 +2652,12 @@ func main() {
 	// Pair / connect to WhatsApp in a goroutine so main can block on signals.
 	go func() {
 		if client.Store.ID == nil {
+			// Every exit from here (success, timeout, any other terminal
+			// event, or the channel simply closing) must stop offering a QR
+			// that no longer means anything: a stale PNG would keep the
+			// contract handing out a qr_link challenge to a dead page, and
+			// health would say "run the login flow" instead of "restart".
+			defer state.ClearPairingQR()
 			qrChan, _ := client.GetQRChannel(context.Background())
 			if err := client.Connect(); err != nil {
 				logger.Errorf("Failed to connect: %v", err)
@@ -2597,6 +2668,7 @@ func main() {
 				case "code":
 					fmt.Println("\nScan this QR code with your WhatsApp app:")
 					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+					state.SetPairingQRCode(evt.Code)
 					if png, err := qrcode.Encode(evt.Code, qrcode.Medium, 256); err == nil {
 						state.SetPairingQRPNG(png)
 					} else {
@@ -2605,8 +2677,11 @@ func main() {
 				case "success":
 					fmt.Println("\nSuccessfully connected and authenticated!")
 					return
-				case "timeout":
-					logger.Errorf("Pairing QR timeout")
+				default:
+					// timeout, err-client-outdated, err-scanned-without-multidevice,
+					// error, or anything else whatsmeow adds later: all of them
+					// end the pairing attempt without a session.
+					slog.Warn("pairing qr channel ended without a session", "event", evt.Event)
 					return
 				}
 			}

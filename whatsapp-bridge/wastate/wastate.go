@@ -1,16 +1,21 @@
 package wastate
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // State tracks the WhatsApp client's connection + login state, the
 // current pairing QR PNG bytes (populated only while pairing is required),
 // and the most recent WhatsApp Web client version string applied to the store.
 type State struct {
-	mu           sync.RWMutex
-	connected    bool
-	loggedIn     bool
-	pairingQRPNG []byte
-	waVersion    string
+	mu             sync.RWMutex
+	connected      bool
+	connectedSince time.Time
+	loggedIn       bool
+	pairingQRPNG   []byte
+	qrCode         string
+	waVersion      string
 }
 
 func New() *State {
@@ -54,7 +59,19 @@ func (s *State) PairingRequired() bool {
 func (s *State) SetConnected(v bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if v && !s.connected {
+		s.connectedSince = time.Now().UTC()
+	}
 	s.connected = v
+}
+
+// ConnectedSince is the zero time until the client has connected at least
+// once; the contract's health endpoint treats that as "no since to report"
+// rather than the Unix epoch.
+func (s *State) ConnectedSince() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.connectedSince
 }
 
 func (s *State) SetLoggedIn(v bool) {
@@ -73,6 +90,22 @@ func (s *State) ClearPairingQR() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pairingQRPNG = nil
+	s.qrCode = ""
+}
+
+// SetPairingQRCode stores the raw QR string ("2@...") whatsmeow published,
+// for anything that needs it besides the PNG rendering (currently nothing
+// in this bridge, but it is cheap to keep in step with the PNG).
+func (s *State) SetPairingQRCode(code string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.qrCode = code
+}
+
+func (s *State) PairingQRCode() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.qrCode
 }
 
 func (s *State) WAVersion() string {

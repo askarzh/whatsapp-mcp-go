@@ -175,6 +175,130 @@ The bridge connects with `sslmode=disable` by default (matching the bundled
 docker-compose network). Set `POSTGRES_SSLMODE` (e.g. `require`,
 `verify-full`) when the database is reached over an untrusted network.
 
+## The bridge contract (`/bridge/v1`)
+
+Alongside `/api`, the bridge exposes a second, separately-authenticated
+surface for the Mindet obligation ledger to read
+messages, chats and contacts and to send and log in — see the platform spec
+(`docs/superpowers/specs/2026-09-07-platform-design.md` in the Mindet
+repository) §3 for the full contract. **Mindet is the only intended caller;
+the MCP server keeps `/api`.**
+
+| Method | Path | Capability | Meaning |
+| --- | --- | --- | --- |
+| `GET` | `/bridge/v1/health` | — | Connection/auth state, capabilities, `since` |
+| `GET` | `/bridge/v1/messages` | `messages` | Arrival-ordered page of messages (cursor, `until`) |
+| `GET` | `/bridge/v1/chats` | `chats` | Direct/group/feed chats known to the bridge |
+| `GET` | `/bridge/v1/contacts` | `contacts` | Address-book contacts with lid/phone aliases |
+| `GET` | `/bridge/v1/media/{id}` | `media` | Fetch (idempotently) and describe one message's file |
+| `POST` | `/bridge/v1/send` | `send` | Send a message, idempotent on `idempotency_key` |
+| `POST` | `/bridge/v1/login` | `login` | Drive the QR/pairing-code login flow |
+
+Three settings gate and shape it:
+
+| Var | Meaning |
+| --- | --- |
+| `MINDET_BRIDGE_TOKEN` | The one static bearer that opens `/bridge/v1`. Empty disables the whole surface; it is a separate door from the `/api` JWT, so neither caller can use the other's credential. ≥32 chars: `openssl rand -base64 48`. |
+| `MEDIA_SHARED_ROOT` | The mount both this bridge and Mindet's daemon can see (default `/shared`). A contract message's `files[].path` is relative to it. |
+| `MEDIA_DOWNLOAD_DIR` | Where `/bridge/v1/media` (and `/api/download`) write decrypted media (default `store`, or `/shared/whatsapp` under the bundled compose file). When `MINDET_BRIDGE_TOKEN` is set this **must** resolve inside `MEDIA_SHARED_ROOT` — startup refuses to come up otherwise, because every `files[].path` the contract hands back would be wrong. |
+
+The QR-link page at `BRIDGE_PUBLIC_URL/bridge/v1/qr/<token>` is
+unauthenticated by design: the token itself is the secret, and it expires
+after ten minutes, so no bearer is needed or checked on that route.
+
+### Deploying with Mindet
+
+`BRIDGE_PUBLIC_URL` has no safe default once `MINDET_BRIDGE_TOKEN` is set:
+the login QR link the daemon relays to the owner is built from it, and a
+`localhost` URL only resolves inside the container. Startup now refuses that
+combination — with the token set, `BRIDGE_PUBLIC_URL` must be present and
+must not be `localhost`/`127.0.0.1` — so a dead login link cannot ship
+quietly. (docker-compose can't express "required only if X is set", so the
+bundled `docker-compose.yaml` still carries a localhost default; the bridge
+is the enforcement.)
+
+**Before the first start against a real mirror**, check how much there is to
+migrate:
+
+```sql
+SELECT count(*) FROM messages WHERE arrival_seq IS NULL;
+```
+
+The first start of this version gives every existing row an arrival order,
+in batches of 50 000, and does not answer HTTP — `/api` included — until it
+finishes; it logs the row count before it starts and the elapsed time as it
+goes. Expect the first start to take proportionally longer on a mirror with
+years of history, and read the log rather than assuming the container hung.
+Later starts skip it entirely (the column is only filled where it is NULL).
+
+Media already downloaded under the old private `store/` path would be
+reported `pending` forever once `MEDIA_DOWNLOAD_DIR` moves, since the bridge
+looks for the file under the new dir. The owner's stack already downloads to
+`/shared/whatsapp`, which is exactly the value this compose file defaults to,
+so nothing is orphaned there; on any other deployment, move or symlink the
+old directory before the first start.
+
+For the owner's own stack (`/home/askar/stack/compose/personal.yml`, not in
+this repository — an operator step, not a code change), add to
+`whatsapp-bridge.environment`:
+
+```yaml
+      MINDET_BRIDGE_TOKEN: ${MINDET_BRIDGE_TOKEN_WHATSAPP:?MINDET_BRIDGE_TOKEN_WHATSAPP must be set in .env}
+      MEDIA_SHARED_ROOT: /shared
+      BRIDGE_PUBLIC_URL: ${WHATSAPP_BRIDGE_PUBLIC_URL:-http://localhost:8080}
+```
+
+Mindet's own `docs/deploy/compose.mindet.yml` already reads
+`MINDET_BRIDGE_TOKEN_WHATSAPP`, so one value in the stack's `.env` serves
+both sides. `WHATSAPP_BRIDGE_PUBLIC_URL` is the stack-wide name for the URL
+the owner's browser reaches this bridge at (it is not read by the bridge
+itself — only `BRIDGE_PUBLIC_URL` is).
+
+### Verification: Mindet's conformance suite against this build
+
+Mindet ships a pytest suite (`tests/contract/`) that is the acceptance test
+for `/bridge/v1` — the same suite runs against Mindet's own fake and, with
+`MINDET_CONTRACT_URL`/`MINDET_CONTRACT_TOKEN` pointed at a live bridge,
+against this one. Four of its nine tests seed a store directly and are
+skipped against a real bridge (they are seeding tests; `TestEndToEndArrivalOrderEditsAndMedia`
+in `whatsapp-bridge/contract_e2e_test.go` covers the same ground as a Go
+test against a real store instead). Run:
+
+The bridge under test needs `BRIDGE_PUBLIC_URL` set to something that is not
+localhost (it is only ever used to build the login QR link, so any hostname
+the owner could reach will do); the suite itself still talks to it on
+whatever address you give `MINDET_CONTRACT_URL`.
+
+```bash
+cd /home/askar/src/mindet
+# MINDET_CONTRACT_URL is the bridge's own base URL, WITHOUT /bridge/v1 —
+# BridgeClient appends that suffix itself (mindet/contract/client.py); passing
+# it here would ask the bridge for /bridge/v1/bridge/v1/... and 404 on
+# everything.
+MINDET_CONTRACT_URL=http://127.0.0.1:18080 \
+MINDET_CONTRACT_TOKEN=<the bridge's MINDET_BRIDGE_TOKEN> \
+uv run pytest tests/contract -q
+```
+
+Last verified against bridge commit `77f8cdc6cbc013e49ec22267215616f0a531b5f3`
+(the code this task's docs/config/test commit sits on top of — the contract
+endpoints under test are unchanged by that commit):
+- SQLite: `5 passed, 4 skipped in 0.32s`
+- Postgres 16 (`IS_POSTGRES=true`, against a throwaway `postgres:16`
+  container; the schema this bridge migrates on startup —
+  `ensureContractColumns` adds the arrival/kind/edits columns, the
+  `messages_arrival_seq` sequence, and backfills them — was confirmed with
+  `\d messages` afterward): `5 passed, 4 skipped in 0.31s`
+
+The bridge does not need a paired WhatsApp session for this: the HTTP server
+comes up before the client connects, and even a failed fetch of the current
+WhatsApp Web client version (no network) only logs and does not stop
+startup (`CustomGetLatestVersion`, called from `main()`). In this run the
+fetch actually succeeded (outbound network was available), so that path
+was not exercised live — it is confirmed by reading `main.go` instead (the
+error from `CustomGetLatestVersion` is logged and the function falls
+through to starting the HTTP server regardless).
+
 ## Architecture Overview
 
 This application consists of two main components:
