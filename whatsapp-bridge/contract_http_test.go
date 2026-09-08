@@ -155,8 +155,27 @@ func TestQRRouteBypassesTheBearerGate(t *testing.T) {
 	if r, _ := get(t, srv.URL+"/bridge/v1/qr/not-a-real-token/png", ""); r.StatusCode == http.StatusUnauthorized {
 		t.Fatalf("qr png must not require a bearer, got %d", r.StatusCode)
 	}
-	if r, _ := get(t, srv.URL+"/bridge/v1/qr/not-a-real-token/status", ""); r.StatusCode == http.StatusUnauthorized {
+	r, status := get(t, srv.URL+"/bridge/v1/qr/not-a-real-token/status", "")
+	if r.StatusCode == http.StatusUnauthorized {
 		t.Fatalf("qr status must not require a bearer, got %d", r.StatusCode)
+	}
+	// An unknown/expired token never reports "paired" regardless of the
+	// WhatsApp session's own login state.
+	if status["paired"] != false || status["expired"] != true {
+		t.Fatalf("unknown token status: %+v", status)
+	}
+
+	// Only exact registered patterns bypass the gate; anything else — no
+	// token, a lookalike prefix, or extra path beyond /png — still needs the
+	// bearer and falls to the gated /bridge/v1/ catch-all.
+	for _, path := range []string{
+		"/bridge/v1/qr",
+		"/bridge/v1/qrx",
+		"/bridge/v1/qr/not-a-real-token/png/extra",
+	} {
+		if r, _ := get(t, srv.URL+path, ""); r.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("%s without a bearer must be 401, got %d", path, r.StatusCode)
+		}
 	}
 }
 
@@ -177,6 +196,12 @@ func TestHealthShape(t *testing.T) {
 	_, h = get(t, srv.URL+"/bridge/v1/health", testToken)
 	if h["auth"] != "needs_login" {
 		t.Fatalf("auth after logout: %v", h["auth"])
+	}
+	// No session and no QR available (a QR channel timeout, or a process
+	// that never started pairing) means the daemon has nothing to offer:
+	// the owner needs to restart the bridge to get a fresh QR channel.
+	if detail, _ := h["detail"].(string); !strings.Contains(detail, "restart") {
+		t.Fatalf("detail with no session and no QR must say restart: %v", h["detail"])
 	}
 }
 

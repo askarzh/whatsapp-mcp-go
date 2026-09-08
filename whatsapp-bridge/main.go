@@ -2647,6 +2647,12 @@ func main() {
 	// Pair / connect to WhatsApp in a goroutine so main can block on signals.
 	go func() {
 		if client.Store.ID == nil {
+			// Every exit from here (success, timeout, any other terminal
+			// event, or the channel simply closing) must stop offering a QR
+			// that no longer means anything: a stale PNG would keep the
+			// contract handing out a qr_link challenge to a dead page, and
+			// health would say "run the login flow" instead of "restart".
+			defer state.ClearPairingQR()
 			qrChan, _ := client.GetQRChannel(context.Background())
 			if err := client.Connect(); err != nil {
 				logger.Errorf("Failed to connect: %v", err)
@@ -2665,10 +2671,12 @@ func main() {
 					}
 				case "success":
 					fmt.Println("\nSuccessfully connected and authenticated!")
-					state.ClearPairingQR()
 					return
-				case "timeout":
-					logger.Errorf("Pairing QR timeout")
+				default:
+					// timeout, err-client-outdated, err-scanned-without-multidevice,
+					// error, or anything else whatsmeow adds later: all of them
+					// end the pairing attempt without a session.
+					slog.Warn("pairing qr channel ended without a session", "event", evt.Event)
 					return
 				}
 			}

@@ -22,10 +22,14 @@ type phonePairer interface {
 }
 
 type loginDisplay struct {
-	Kind      string `json:"kind"`
-	URL       string `json:"url,omitempty"`
-	Code      string `json:"code,omitempty"`
-	ExpiresAt string `json:"expires_at,omitempty"`
+	Kind string `json:"kind"`
+	URL  string `json:"url,omitempty"`
+	Code string `json:"code,omitempty"`
+	// ImagePNG is always nil for WhatsApp: the PNG is served from
+	// /bridge/v1/qr/{token}/png, never inlined. The key stays present (and
+	// null) so the emitted shape matches spec §15's display object exactly.
+	ImagePNG  *string `json:"image_png_base64"`
+	ExpiresAt string  `json:"expires_at,omitempty"`
 }
 
 type loginChallenge struct {
@@ -91,16 +95,34 @@ func (l *loginFlow) challenge(sess *loginSession) *loginChallenge {
 	return c
 }
 
+// evictExpiredLocked drops sessions whose QR link has expired. Called with
+// l.mu held: a login flow that runs for weeks must not accumulate one map
+// entry per attempt forever.
+func (l *loginFlow) evictExpiredLocked() {
+	now := l.now()
+	for id, s := range l.sessions {
+		if !now.Before(s.created.Add(qrLinkTTL)) {
+			delete(l.sessions, id)
+		}
+	}
+}
+
 // Step is one round of the challenge-response. The bridge dictates the step,
 // Mindet relays it; nothing about WhatsApp leaks into Mindet.
+//
+// The lock is held only to resolve/create the session and read what
+// challenge() needs; it is released before PairPhone, a network call that
+// can take tens of seconds, so a slow pairing attempt never blocks the QR
+// page's /status and /png polls or a concurrent /login call.
 func (l *loginFlow) Step(sessionID *string, response *string) loginReply {
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.evictExpiredLocked()
 	if l.state.LoggedIn() {
 		id := ""
 		if sessionID != nil {
 			id = *sessionID
 		}
+		l.mu.Unlock()
 		return loginReply{SessionID: id, Status: "authenticated", Detail: "WhatsApp session is active"}
 	}
 	var sess *loginSession
@@ -113,16 +135,22 @@ func (l *loginFlow) Step(sessionID *string, response *string) loginReply {
 		id = *sessionID
 		sess = l.sessions[id]
 		if sess == nil {
+			l.mu.Unlock()
 			return loginReply{SessionID: id, Status: "failed", Detail: "unknown login session"}
 		}
 	}
 	if response != nil && *response != "" {
 		phone := digitsOnly(*response)
 		if len(phone) < 8 {
-			return loginReply{SessionID: id, Status: "in_progress", Challenge: l.challenge(sess),
+			reply := loginReply{SessionID: id, Status: "in_progress", Challenge: l.challenge(sess),
 				Detail: "that does not look like a phone number"}
+			l.mu.Unlock()
+			return reply
 		}
-		code, err := l.pairer.PairPhone(context.Background(), phone)
+		l.mu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		code, err := l.pairer.PairPhone(ctx, phone)
 		if err != nil {
 			return loginReply{SessionID: id, Status: "failed", Detail: "pairing code unavailable: " + err.Error()}
 		}
@@ -132,7 +160,9 @@ func (l *loginFlow) Step(sessionID *string, response *string) loginReply {
 			Display:   &loginDisplay{Kind: "pairing_code", Code: code, ExpiresAt: fmtTime(l.now().Add(3 * time.Minute))},
 		}}
 	}
-	return loginReply{SessionID: id, Status: "in_progress", Challenge: l.challenge(sess)}
+	reply := loginReply{SessionID: id, Status: "in_progress", Challenge: l.challenge(sess)}
+	l.mu.Unlock()
+	return reply
 }
 
 func (l *loginFlow) sessionByToken(token string) *loginSession {
@@ -189,7 +219,13 @@ func (l *loginFlow) QRPNG(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(png)
 }
 
+// QRStatus reports "paired" only for a token that is still live: an unknown
+// or expired token was never a promise the bridge is now honoring, so it
+// answers not-paired/expired regardless of the WhatsApp session's own state.
 func (l *loginFlow) QRStatus(w http.ResponseWriter, r *http.Request) {
-	expired := l.sessionByToken(r.PathValue("token")) == nil
-	writeJSON(w, 200, map[string]any{"paired": l.state.LoggedIn(), "expired": expired})
+	if l.sessionByToken(r.PathValue("token")) == nil {
+		writeJSON(w, 200, map[string]any{"paired": false, "expired": true})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"paired": l.state.LoggedIn(), "expired": false})
 }
