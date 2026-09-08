@@ -21,6 +21,9 @@ services:
     environment:
       WHATSAPP_API_KEY: "${WHATSAPP_API_KEY:?set WHATSAPP_API_KEY in environment or .env}"
       WHATSAPP_JWT_SECRET: "${WHATSAPP_JWT_SECRET:?set WHATSAPP_JWT_SECRET in environment or .env}"
+      # Times on /bridge/v1 are UTC by contract and the messages table keeps
+      # no zone; a container in a local zone would label them wrongly.
+      TZ: "UTC"
       IS_POSTGRES: "true"
       POSTGRES_USER: "${POSTGRES_USER}"
       POSTGRES_PASS: "${POSTGRES_PASS}"

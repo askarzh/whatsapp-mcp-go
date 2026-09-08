@@ -208,7 +208,12 @@ func scanArrived(rows *sql.Rows) (ArrivedMessage, error) {
 	err := rows.Scan(&m.Seq, &arrived, &m.ID, &m.ChatJID, &m.Sender, &m.Content, &m.Timestamp, &m.IsFromMe,
 		&m.MediaType, &m.Filename, &m.URL, &m.MediaKey, &m.FileSHA256, &m.FileEncSHA256, &fileLength, &m.Kind, &m.Edits)
 	m.ArrivedAt = time.Unix(arrived, 0).UTC()
-	m.Timestamp = m.Timestamp.UTC()
+	// messages.timestamp has no zone in the schema, so whatever the driver
+	// labelled the wall clock with, the clock itself is the UTC one this
+	// bridge wrote (the connection pins the session to UTC). Say so
+	// explicitly rather than converting an offset that was never stored.
+	t := m.Timestamp
+	m.Timestamp = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
 	m.FileLength = uint64(fileLength)
 	if m.Kind == "" {
 		m.Kind = "chat"

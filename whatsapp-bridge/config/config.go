@@ -23,11 +23,15 @@ type dbConfig struct {
 // URL-escaped, so passwords containing reserved characters don't corrupt it.
 func (d dbConfig) ConnString(dbName string) string {
 	u := url.URL{
-		Scheme:   "postgresql",
-		User:     url.UserPassword(d.User, d.Pass),
-		Host:     d.Host + ":" + d.Port,
-		Path:     "/" + dbName,
-		RawQuery: "sslmode=" + url.QueryEscape(d.SSLMode),
+		Scheme: "postgresql",
+		User:   url.UserPassword(d.User, d.Pass),
+		Host:   d.Host + ":" + d.Port,
+		Path:   "/" + dbName,
+		// timezone=UTC: messages.timestamp is a naive TIMESTAMP, so what the
+		// driver stores and reads back is a wall clock in the session's zone.
+		// Pinning the session to UTC is what makes the +00:00 the contract
+		// puts on every sent_at true (platform spec §7).
+		RawQuery: "sslmode=" + url.QueryEscape(d.SSLMode) + "&timezone=UTC",
 	}
 	return u.String()
 }

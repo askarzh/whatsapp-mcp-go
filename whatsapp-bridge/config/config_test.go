@@ -10,7 +10,7 @@ func TestConnString(t *testing.T) {
 	t.Run("builds a postgres URL with sslmode", func(t *testing.T) {
 		db := dbConfig{User: "wa", Pass: "secret", Host: "postgres", Port: "5432", SSLMode: "require"}
 		got := db.ConnString("whatsapp")
-		want := "postgresql://wa:secret@postgres:5432/whatsapp?sslmode=require"
+		want := "postgresql://wa:secret@postgres:5432/whatsapp?sslmode=require&timezone=UTC"
 		if got != want {
 			t.Errorf("ConnString = %q, want %q", got, want)
 		}
@@ -24,6 +24,16 @@ func TestConnString(t *testing.T) {
 		}
 		if !strings.Contains(got, "@postgres:5432/whatsapp") {
 			t.Errorf("host/db malformed in %q", got)
+		}
+	})
+
+	// A naive timestamp column reads back as a wall clock in the session's
+	// zone; if that zone is the owner's, every sent_at on the contract is
+	// hours wrong while still claiming +00:00.
+	t.Run("pins the session to UTC", func(t *testing.T) {
+		db := dbConfig{User: "wa", Pass: "secret", Host: "postgres", Port: "5432", SSLMode: "disable"}
+		if got := db.ConnString("whatsapp"); !strings.Contains(got, "timezone=UTC") {
+			t.Errorf("ConnString = %q, want it to carry timezone=UTC", got)
 		}
 	})
 }
