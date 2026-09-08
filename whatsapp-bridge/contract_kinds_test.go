@@ -8,6 +8,7 @@ import (
 
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -47,8 +48,65 @@ func TestAuthorKeyOnlyFromAPhoneNumber(t *testing.T) {
 		t.Fatalf("lid sender must have no key and one raw id: %+v", l)
 	}
 	me := authorOf("77000000009", true, "77000000009@s.whatsapp.net")
-	if !me.IsOwner || me.NativeID != "77000000009@s.whatsapp.net" {
+	if !me.IsOwner || me.NativeID != "77000000009@s.whatsapp.net" || me.Key == nil || *me.Key != "e164:+77000000009" {
 		t.Fatalf("owner: %+v", me)
+	}
+}
+
+// The form a live @lid message actually leaves in the store: whatsmeow hands
+// us the lid JID, resolveSenderPN cannot map it to a phone, and the digits
+// of a linked id are not a phone number. Keying them would put the boss's
+// directives on a person who does not exist.
+func TestAuthorNeverInventsAKeyForALinkedOrUnknownSender(t *testing.T) {
+	live := authorOf("1839000000000000@lid", false, "77000000009@s.whatsapp.net")
+	if live.Key != nil || len(live.Raw) != 1 || live.Raw[0].Type != "wa_lid" || live.Raw[0].Value != "1839000000000000@lid" {
+		t.Fatalf("a live lid sender must carry no key and one raw id: %+v", live)
+	}
+	odd := authorOf("some-name", false, "77000000009@s.whatsapp.net")
+	if odd.Key != nil || len(odd.Raw) != 1 || odd.Raw[0].Type != "wa_user" || odd.Raw[0].Value != "some-name" {
+		t.Fatalf("an unrecognised sender must still carry a raw id: %+v", odd)
+	}
+	other := authorOf("120363000000000000@g.us", false, "77000000009@s.whatsapp.net")
+	if other.Key != nil || len(other.Raw) != 1 {
+		t.Fatalf("a non-phone server must not be keyed: %+v", other)
+	}
+	plain := authorOf("77000000001@s.whatsapp.net", false, "77000000009@s.whatsapp.net")
+	if plain.Key == nil || *plain.Key != "e164:+77000000001" {
+		t.Fatalf("a full phone JID is still a phone number: %+v", plain)
+	}
+}
+
+// /bridge/v1 is served whether or not there is a WhatsApp session, so
+// OwnerJID() can be empty. "e164:+" is not an identity.
+func TestOwnerWithoutAJIDGetsNoKey(t *testing.T) {
+	none := authorOf("", true, "")
+	if none.Key != nil || !none.IsOwner || none.NativeID != "" {
+		t.Fatalf("logged-out owner: %+v", none)
+	}
+	lid := authorOf("", true, "1839000000000000@lid")
+	if lid.Key != nil || !lid.IsOwner || lid.NativeID != "1839000000000000@lid" {
+		t.Fatalf("lid-first owner: %+v", lid)
+	}
+}
+
+// What handleMessage writes for a sender still hidden behind a linked id:
+// the full JID, never the bare digits.
+func TestStoredSenderKeepsTheLidSuffix(t *testing.T) {
+	lid := types.JID{User: "1839000000000000", Server: types.HiddenUserServer}
+	pn := types.JID{User: "77000000001", Server: types.DefaultUserServer}
+	info := types.MessageInfo{MessageSource: types.MessageSource{Sender: lid}}
+	if got := storedSender(info, lid); got != "1839000000000000@lid" {
+		t.Fatalf("unmapped lid sender stored as %q", got)
+	}
+	if got := storedSender(info, pn); got != "77000000001" {
+		t.Fatalf("resolved phone sender stored as %q", got)
+	}
+	if got := storedSender(info, types.JID{}); got != "1839000000000000@lid" {
+		t.Fatalf("empty resolution must fall back to the delivered sender, got %q", got)
+	}
+	// and the round trip: what we store is what authorOf refuses to key
+	if a := authorOf(storedSender(info, lid), false, ""); a.Key != nil {
+		t.Fatalf("stored lid sender got a key: %+v", a)
 	}
 }
 

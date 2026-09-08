@@ -535,7 +535,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	ctx := context.Background()
 	chat := resolvePNJID(ctx, client.Store.LIDs, msg.Info.Chat)
 	chatJID := chat.String()
-	sender := resolveSenderPN(ctx, client.Store.LIDs, msg.Info).User
+	sender := storedSender(msg.Info, resolveSenderPN(ctx, client.Store.LIDs, msg.Info))
 
 	name := GetChatName(client, messageStore, chat, chatJID, nil,
 		nameHintForChat(msg.Info.IsFromMe, sender), logger)
@@ -1506,7 +1506,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 						// Participants can be @lid; store the phone-number
 						// user part when the mapping is known.
 						if pJID, err := types.ParseJID(sender); err == nil {
-							sender = resolvePNJID(context.Background(), client.Store.LIDs, pJID).User
+							sender = senderKeyOf(resolvePNJID(context.Background(), client.Store.LIDs, pJID))
 						}
 					} else if isFromMe {
 						sender = client.Store.ID.User

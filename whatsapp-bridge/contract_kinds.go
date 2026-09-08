@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
 )
 
 const timeLayout = "2006-01-02T15:04:05.000000+00:00"
@@ -52,24 +53,34 @@ func isDigits(s string) bool {
 	return true
 }
 
-// authorOf turns the stored sender (a user part such as "7700…" or a full
-// "@lid" JID) into the contract's author. A key is only ever made from a
-// phone number (spec §4); a linked id is passed raw for the roster to bind.
+// authorOf turns the stored sender (a phone user part such as "7700…", or a
+// full "@lid" JID) into the contract's author. A key is only ever minted
+// from a phone number (spec §4): a linked id, an unresolved peer or an owner
+// JID we do not have goes out with no key and a raw identifier the roster
+// can bind later. Nothing here invents a phone number that was never seen.
 func authorOf(sender string, isFromMe bool, ownerJID string) contractAuthor {
 	if isFromMe {
-		owner := ownerJID
-		key := "e164:+" + strings.SplitN(ownerJID, "@", 2)[0]
-		return contractAuthor{NativeID: owner, Key: &key, IsOwner: true}
+		a := contractAuthor{NativeID: ownerJID, IsOwner: true}
+		// Logged out, OwnerJID() is empty; a LID-first account would give a
+		// non-phone server. Neither is an identity we may key on.
+		if user, server, ok := strings.Cut(ownerJID, "@"); ok && server == types.DefaultUserServer && isDigits(user) {
+			key := "e164:+" + user
+			a.Key = &key
+		}
+		return a
 	}
 	user, server, hasServer := strings.Cut(sender, "@")
-	if hasServer && server == "lid" {
+	switch {
+	case hasServer && server == types.HiddenUserServer:
 		return contractAuthor{NativeID: sender, Raw: []rawID{{Type: "wa_lid", Value: sender}}}
-	}
-	if isDigits(user) {
+	case (!hasServer || server == types.DefaultUserServer) && isDigits(user):
 		key := "e164:+" + user
 		return contractAuthor{NativeID: user + "@s.whatsapp.net", Key: &key}
 	}
-	return contractAuthor{NativeID: sender}
+	// Anything else — a name, a group participant we could not parse, a
+	// server we do not know — is reported as it was stored, never keyed and
+	// never silently anonymous.
+	return contractAuthor{NativeID: sender, Raw: []rawID{{Type: "wa_user", Value: sender}}}
 }
 
 type contractFile struct {
