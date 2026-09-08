@@ -118,3 +118,58 @@ func TestMediaDownloadDir(t *testing.T) {
 		t.Errorf("MediaDirs = %v, want [/data/media] verbatim", cfg.MediaDirs)
 	}
 }
+
+// MINDET_BRIDGE_TOKEN gates /bridge/v1: too short is a startup error like any
+// other secret, unset is allowed but warns (the surface just stays off).
+func TestMindetBridgeToken(t *testing.T) {
+	t.Setenv("WHATSAPP_API_KEY", strings.Repeat("k", 32))
+	t.Setenv("WHATSAPP_JWT_SECRET", strings.Repeat("j", 32))
+
+	t.Run("too short is an error naming the var", func(t *testing.T) {
+		t.Setenv("MINDET_BRIDGE_TOKEN", "short")
+		_, err := LoadConfig()
+		if err == nil || !strings.Contains(err.Error(), "MINDET_BRIDGE_TOKEN") {
+			t.Fatalf("LoadConfig error = %v, want it to mention MINDET_BRIDGE_TOKEN", err)
+		}
+	})
+
+	t.Run("unset warns but does not fail", func(t *testing.T) {
+		t.Setenv("MINDET_BRIDGE_TOKEN", "")
+		var warned bool
+		old := envWarnFn
+		envWarnFn = func(msg string, args ...any) {
+			if strings.Contains(msg, "MINDET_BRIDGE_TOKEN") {
+				warned = true
+			}
+		}
+		t.Cleanup(func() { envWarnFn = old })
+
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.MindetBridgeToken != "" {
+			t.Errorf("MindetBridgeToken = %q, want empty", cfg.MindetBridgeToken)
+		}
+		if !warned {
+			t.Error("expected a warning naming MINDET_BRIDGE_TOKEN")
+		}
+	})
+
+	t.Run("valid token passes through and defaults apply", func(t *testing.T) {
+		t.Setenv("MINDET_BRIDGE_TOKEN", strings.Repeat("t", 32))
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.MindetBridgeToken != strings.Repeat("t", 32) {
+			t.Errorf("MindetBridgeToken = %q", cfg.MindetBridgeToken)
+		}
+		if cfg.MediaSharedRoot != "/shared" {
+			t.Errorf("MediaSharedRoot = %q, want /shared", cfg.MediaSharedRoot)
+		}
+		if cfg.PublicURL != "http://localhost:8080" {
+			t.Errorf("PublicURL = %q, want http://localhost:8080", cfg.PublicURL)
+		}
+	})
+}

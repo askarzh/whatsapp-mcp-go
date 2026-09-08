@@ -212,3 +212,67 @@ func (store *MessageStore) LookupMessage(id, chatJID string) (*ArrivedMessage, e
 	m, err := scanArrived(rows)
 	return &m, err
 }
+
+func (store *MessageStore) ListChatsForContract() ([]contractChat, error) {
+	rows, err := store.db.Query(`SELECT jid, name FROM chats ORDER BY jid`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []contractChat{}
+	for rows.Next() {
+		var jid string
+		var name sql.NullString
+		if err := rows.Scan(&jid, &name); err != nil {
+			return nil, err
+		}
+		c := contractChat{NativeID: jid, Kind: chatKind(jid)}
+		if name.Valid && name.String != "" {
+			n := name.String
+			c.Name = &n
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// Contacts come from whatsmeow's own address-book table, with every linked id
+// the lid map knows for the same phone as an alias (spec §4).
+func (store *MessageStore) ListContactsForContract() ([]contractContact, error) {
+	agg := "group_concat"
+	if isPostgres {
+		agg = "string_agg"
+	}
+	// lid and pn in whatsmeow_lid_map are bare user parts; the alias goes out
+	// as a full JID so the raw id matches what a message's author carries.
+	rows, err := store.db.Query(fmt.Sprintf(`SELECT c.their_jid, coalesce(nullif(c.full_name,''), nullif(c.push_name,''), '') AS name,
+		coalesce((SELECT %s(l.lid || '@lid', ',') FROM whatsmeow_lid_map l WHERE l.pn || '@s.whatsapp.net' = c.their_jid), '') AS lids
+		FROM whatsmeow_contacts c WHERE c.their_jid LIKE '%%@s.whatsapp.net' ORDER BY c.their_jid`, agg))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []contractContact{}
+	for rows.Next() {
+		var jid, name, lids string
+		if err := rows.Scan(&jid, &name, &lids); err != nil {
+			return nil, err
+		}
+		c := contractContact{NativeID: jid, Aliases: []rawID{}}
+		if user, _, _ := strings.Cut(jid, "@"); isDigits(user) {
+			k := "e164:+" + user
+			c.Key = &k
+		}
+		if name != "" {
+			n := name
+			c.Name = &n
+		}
+		for _, lid := range strings.Split(lids, ",") {
+			if lid != "" {
+				c.Aliases = append(c.Aliases, rawID{Type: "wa_lid", Value: lid})
+			}
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}

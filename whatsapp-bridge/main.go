@@ -1262,6 +1262,20 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 	http.Handle("/api/", http.StripPrefix("/api", protected))
 	http.Handle("/auth/login", auth.LoginHandler(cfg))
 
+	// Mindet's own surface: a static bearer, not the JWT above. Empty token
+	// means Mindet isn't deployed against this bridge yet, so the mount
+	// itself stays off.
+	if cfg.MindetBridgeToken != "" {
+		deps := &contractDeps{Store: messageStore, State: state, Cfg: cfg,
+			OwnerJID: func() string {
+				if client.Store.ID == nil {
+					return ""
+				}
+				return client.Store.ID.ToNonAD().String()
+			}}
+		http.Handle("/bridge/v1/", http.StripPrefix("/bridge/v1", newContractMux(deps)))
+	}
+
 	serverAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	slog.Info("starting REST API server", "addr", serverAddr)
 

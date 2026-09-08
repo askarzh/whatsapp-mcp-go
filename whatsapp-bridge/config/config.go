@@ -47,6 +47,19 @@ type Config struct {
 	// read — point it at a shared mount (e.g. /shared/whatsapp) when the file
 	// has to be reachable by files-mcp or the MCP server.
 	MediaDownloadDir string
+
+	// MindetBridgeToken is the one static bearer that opens /bridge/v1 for
+	// Mindet. Empty disables the contract surface entirely; it is a separate
+	// door from the JWT that guards /api, so neither caller can use the
+	// other's credential.
+	MindetBridgeToken string
+
+	// MediaSharedRoot is the mount both this bridge and Mindet's daemon can
+	// see; a contract message's file path is relative to it.
+	MediaSharedRoot string
+
+	// PublicURL is where Mindet reaches this bridge.
+	PublicURL string
 }
 
 func LoadConfig() (*Config, error) {
@@ -101,6 +114,23 @@ func LoadConfig() (*Config, error) {
 
 	authLoginRate := os.Getenv("AUTH_LOGIN_RATE") // parsed in auth package; empty -> default
 
+	mindetToken := os.Getenv("MINDET_BRIDGE_TOKEN")
+	if mindetToken != "" {
+		if err := validateSecret("MINDET_BRIDGE_TOKEN", mindetToken); err != nil {
+			return nil, err
+		}
+	} else {
+		envWarnFn("MINDET_BRIDGE_TOKEN not set; /bridge/v1 is disabled")
+	}
+	sharedRoot := os.Getenv("MEDIA_SHARED_ROOT")
+	if sharedRoot == "" {
+		sharedRoot = "/shared"
+	}
+	publicURL := os.Getenv("BRIDGE_PUBLIC_URL")
+	if publicURL == "" {
+		publicURL = fmt.Sprintf("http://localhost:%d", serverPort)
+	}
+
 	sslMode := os.Getenv("POSTGRES_SSLMODE")
 	if sslMode == "" {
 		sslMode = "disable"
@@ -133,14 +163,17 @@ func LoadConfig() (*Config, error) {
 			IsPostgres: isPostgres,
 			SSLMode:    sslMode,
 		},
-		JWTSecret:        []byte(jwtSecret),
-		APIKey:           apiKey,
-		WebhookUrl:       webhookUrl,
-		Host:             serverHost,
-		Port:             serverPort,
-		AuthLoginRate:    authLoginRate,
-		MediaDirs:        mediaDirs,
-		MediaDownloadDir: mediaDownloadDir,
+		JWTSecret:         []byte(jwtSecret),
+		APIKey:            apiKey,
+		WebhookUrl:        webhookUrl,
+		Host:              serverHost,
+		Port:              serverPort,
+		AuthLoginRate:     authLoginRate,
+		MediaDirs:         mediaDirs,
+		MediaDownloadDir:  mediaDownloadDir,
+		MindetBridgeToken: mindetToken,
+		MediaSharedRoot:   sharedRoot,
+		PublicURL:         publicURL,
 	}, nil
 }
 
